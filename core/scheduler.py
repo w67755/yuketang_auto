@@ -85,6 +85,21 @@ def strip_datetime_noise(text: str) -> str:
     return cleaned
 
 
+def has_incomplete_progress(text: str) -> bool:
+    """检测文本中是否带有“未满 100%”的百分比或分数（例如 '已完成 34%'、'33.9%'、'进行中(70/75)'、'0/25'）。"""
+    if not text:
+        return False
+    cleaned = strip_datetime_noise(text)
+    for pct_match in re.finditer(r"(\d{1,3}(?:\.\d+)?)\s*%", cleaned):
+        if float(pct_match.group(1)) < 99.9:
+            return True
+    for frac_match in re.finditer(r"(\d{1,4})\s*/\s*(\d{1,4})", cleaned):
+        done, total = int(frac_match.group(1)), int(frac_match.group(2))
+        if total > 0 and done < total:
+            return True
+    return False
+
+
 def is_progress_fraction_completed(text: str) -> bool:
     """判断任务卡片文本中的“分子/分母”进度是否已达 100%（例如 '69/69 学习进度'、'36/36'、'1/1'）。
 
@@ -95,6 +110,37 @@ def is_progress_fraction_completed(text: str) -> bool:
     for match in re.finditer(r"(\d{1,4})\s*/\s*(\d{1,4})", strip_datetime_noise(text)):
         done, total = int(match.group(1)), int(match.group(2))
         if total > 0 and done >= total:
+            return True
+    return False
+
+
+def is_task_truly_completed(text: str) -> bool:
+    """严格判断任务是否已 100% 完成（防止 '已完成 34%' 或 '进行中(70/75)' 被误判为已完成）。"""
+    if not text:
+        return False
+    if "未完成" in text or "未开始" in text or "未提交" in text:
+        return False
+    if has_incomplete_progress(text):
+        return False
+    if is_progress_fraction_completed(text):
+        return True
+    return any(done_kw in text for done_kw in SELECTORS.completed_keywords)
+
+
+def is_partially_started(text: str) -> bool:
+    """判断任务是否处于“已经看了一点但尚未看完”的半程状态（用于优先续播断点任务）。"""
+    if not text or "未开始" in text:
+        return False
+    cleaned = strip_datetime_noise(text)
+    if any(kw in cleaned for kw in ("进行中", "学习中", "已观看", "已学习")):
+        return True
+    for pct_match in re.finditer(r"(\d{1,3}(?:\.\d+)?)\s*%", cleaned):
+        val = float(pct_match.group(1))
+        if 0.0 < val < 99.9:
+            return True
+    for frac_match in re.finditer(r"(\d{1,4})\s*/\s*(\d{1,4})", cleaned):
+        done, total = int(frac_match.group(1)), int(frac_match.group(2))
+        if total > 0 and 0 < done < total:
             return True
     return False
 
@@ -388,7 +434,7 @@ class CourseScheduler:
             if study_item is not None:
                 return study_item
 
-        candidates: List[Tuple[int, int, str, str, TaskKind, object]] = []
+        candidates: List[Tuple[int, int, int, str, str, TaskKind, object]] = []
         seq = 0
 
         # 1. 先按已知任务卡片选择器收集候选
@@ -412,9 +458,7 @@ class CourseScheduler:
                     continue
                 if is_collapsible_bundle_text(raw_text) or is_protected_essay_task(raw_text):
                     continue
-                if any(done_kw in raw_text for done_kw in SELECTORS.completed_keywords):
-                    continue
-                if is_progress_fraction_completed(raw_text):
+                if is_task_truly_completed(raw_text):
                     continue
 
                 guessed_kind = classify_task_text(raw_text)
@@ -428,13 +472,15 @@ class CourseScheduler:
                     continue
 
                 rank = task_priority_rank(guessed_kind, self.config.task_order)
-                candidates.append((rank, seq, task_key, short_title, guessed_kind, item))
+                # 同类型任务中，看了一半的任务（resume_rank=0）优先于 0% 未开始任务（resume_rank=1）
+                resume_rank = 0 if is_partially_started(raw_text) else 1
+                candidates.append((rank, resume_rank, seq, task_key, short_title, guessed_kind, item))
                 seq += 1
 
             # 首个有效选择器已找到候选时即可按优先级排序返回，避免重复匹配嵌套子节点
             if candidates:
-                candidates.sort(key=lambda c: (c[0], c[1]))
-                _, _, task_key, short_title, guessed_kind, item = candidates[0]
+                candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+                _, _, _, task_key, short_title, guessed_kind, item = candidates[0]
                 return task_key, short_title, guessed_kind, item
 
         # 2. 语义兜底：针对动态类名页面按最小包含块匹配并按优先级排序（严格排除导航栏与左侧目录）
@@ -442,7 +488,6 @@ class CourseScheduler:
             fallback_nodes = driver.execute_script(
                 """
                 const kws = ['课件', 'PPT', '视频', '录播', '习题', '作业', '测验', '预习', '未完成', '未读', '未看', '未开始', '进行中', '讲'];
-                const done = ['已完成', '已读', '已看完', '100%', '已提交', '已作答'];
                 const candidates = Array.from(document.querySelectorAll('div, li, section, article, a'));
                 const matched = [];
                 for (const el of candidates) {
@@ -451,7 +496,6 @@ class CourseScheduler:
                   if (rect.width < 120 || rect.height < 28 || rect.height > 260) continue;
                   const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
                   if (txt.length < 6 || txt.length > 260) continue;
-                  if (done.some((d) => txt.includes(d))) continue;
                   if (!kws.some((k) => txt.includes(k))) continue;
                   const hasChildMatch = Array.from(el.children).some((c) => {
                     const ct = (c.innerText || '').replace(/\\s+/g, ' ').trim();
@@ -466,7 +510,7 @@ class CourseScheduler:
                 raw_text = " ".join((node.text or "").split())
                 if not raw_text or raw_text in SELECTORS.ignored_nav_texts:
                     continue
-                if is_collapsible_bundle_text(raw_text) or is_protected_essay_task(raw_text) or is_progress_fraction_completed(raw_text):
+                if is_collapsible_bundle_text(raw_text) or is_protected_essay_task(raw_text) or is_task_truly_completed(raw_text):
                     continue
                 guessed_kind = classify_task_text(raw_text)
                 if not self._is_kind_enabled(guessed_kind):
@@ -477,11 +521,12 @@ class CourseScheduler:
                 if task_key in attempted_keys:
                     continue
                 rank = task_priority_rank(guessed_kind, self.config.task_order)
-                candidates.append((rank, idx, task_key, short_title, guessed_kind, node))
+                resume_rank = 0 if is_partially_started(raw_text) else 1
+                candidates.append((rank, resume_rank, idx, task_key, short_title, guessed_kind, node))
 
             if candidates:
-                candidates.sort(key=lambda c: (c[0], c[1]))
-                _, _, task_key, short_title, guessed_kind, item = candidates[0]
+                candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+                _, _, _, task_key, short_title, guessed_kind, item = candidates[0]
                 return task_key, short_title, guessed_kind, item
         except WebDriverException:
             pass
@@ -507,9 +552,24 @@ class CourseScheduler:
                   .filter((el) => {
                     const rect = el.getBoundingClientRect();
                     if (rect.width <= 0 || rect.height <= 0 || rect.height > 48) return false;
+                    const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
+                    if (cls.includes('color-9b')) return false;
                     const txt = (el.innerText || '').replace(/\s+/g, ' ').trim();
-                    if (!txt || txt.length > 24) return false;
-                    return txt === '未开始' || /^进行中/.test(txt) || /^已观看/.test(txt) || txt === '未完成' || txt === '未提交';
+                    if (!txt || txt.length > 32) return false;
+                    if (txt === '已完成' || txt === '已读' || txt === '已提交' || txt === '100%') return false;
+                    // 匹配所有蓝色状态角标（含 “已完成 34%”、“已观看 34%”、“34%”、“进行中”、“学习中”、“未开始”）
+                    if (cls.includes('blue-color')) return true;
+                    return (
+                      txt === '未开始' ||
+                      /^进行中/.test(txt) ||
+                      /^学习中/.test(txt) ||
+                      /^已观看/.test(txt) ||
+                      /^已学习/.test(txt) ||
+                      /^已完成\s*\d{1,2}(?:\.\d+)?\s*%/.test(txt) ||
+                      /^\d{1,2}(?:\.\d+)?\s*%$/.test(txt) ||
+                      txt === '未完成' ||
+                      txt === '未提交'
+                    );
                   });
 
                 const seen = new Set();
@@ -570,7 +630,7 @@ class CourseScheduler:
         except WebDriverException:
             return None
 
-        candidates: List[Tuple[int, int, str, str, TaskKind, object]] = []
+        candidates: List[Tuple[int, int, int, str, str, TaskKind, object]] = []
         for idx, row in enumerate(rows):
             raw_text = (row.get("text") or "").strip()
             status_text = (row.get("status") or "").strip()
@@ -578,11 +638,9 @@ class CourseScheduler:
             element = row.get("element")
             if not raw_text or element is None:
                 continue
-            if any(done_kw in raw_text for done_kw in SELECTORS.completed_keywords):
-                continue
             if is_protected_essay_task(raw_text):
                 continue
-            if is_progress_fraction_completed(raw_text):
+            if is_task_truly_completed(status_text) or is_task_truly_completed(raw_text):
                 continue
 
             # 结合图标特征 + 状态文本精准判定该行是视频、课件还是习题
@@ -598,13 +656,15 @@ class CourseScheduler:
                 continue
 
             rank = task_priority_rank(guessed_kind, self.config.task_order)
-            candidates.append((rank, idx, task_key, f"{clean_title} [{status_text}]", guessed_kind, element))
+            # 优先续播已经看了一点的半程任务（如 34%、进行中），再开 0% “未开始”任务
+            resume_rank = 0 if (is_partially_started(status_text) or is_partially_started(raw_text)) else 1
+            candidates.append((rank, resume_rank, idx, task_key, f"{clean_title} [{status_text}]", guessed_kind, element))
 
         if not candidates:
             return None
 
-        candidates.sort(key=lambda c: (c[0], c[1]))
-        _, _, task_key, display_title, guessed_kind, element = candidates[0]
+        candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+        _, _, _, task_key, display_title, guessed_kind, element = candidates[0]
         return task_key, display_title, guessed_kind, element
 
     def _classify_studycontent_row(self, raw_text: str, status_text: str, icon_hint: str) -> TaskKind:
@@ -625,8 +685,12 @@ class CourseScheduler:
         guessed = classify_task_text(raw_text)
         if guessed != TaskKind.UNKNOWN:
             return guessed
-        # 4. 在“视频学习”章节下的“未开始”且无 X/Y 分数的普通讲次，默认判为视频
-        if status_text == "未开始" or status_text.startswith("已观看"):
+        # 4. 在“视频学习”章节下的“未开始”或带百分比进度的普通讲次，默认判为视频
+        if (
+            status_text == "未开始"
+            or status_text.startswith(("已观看", "已学习", "进行中", "学习中", "已完成"))
+            or "%" in status_text
+        ):
             return TaskKind.VIDEO
         return TaskKind.UNKNOWN
 

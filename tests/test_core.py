@@ -11,8 +11,10 @@ from core.scheduler import (
     classify_task_text,
     detect_page_task_kind,
     is_collapsible_bundle_text,
+    is_partially_started,
     is_progress_fraction_completed,
     is_protected_essay_task,
+    is_task_truly_completed,
     task_priority_rank,
 )
 from tasks.auto_quiz import detect_question_type, match_option_indices
@@ -94,6 +96,13 @@ class TestCoreLogic(unittest.TestCase):
         self.assertTrue(is_protected_essay_task("专题心得体会 请在2027-01-31前完成 未开始"))
         self.assertTrue(is_protected_essay_task("期末小论文 未提交"))
         self.assertFalse(is_protected_essay_task("第五讲双碳行动中的中国与世界 未开始"))
+        # 半程视频（如 “已完成 34%” / “进行中(34%)” / “34%”）绝不能误判为已完成，且应识别为半程优先任务
+        self.assertFalse(is_task_truly_completed("第六讲大国外交 请在2027-01-31/23:59前完成学习 已完成 34%"))
+        self.assertFalse(is_task_truly_completed("进行中(33.9%)"))
+        self.assertTrue(is_task_truly_completed("第四讲 文化自信与文化强国 已完成"))
+        self.assertTrue(is_partially_started("已完成 34%"))
+        self.assertTrue(is_partially_started("进行中(70/75)"))
+        self.assertFalse(is_partially_started("未开始"))
         self.assertLess(task_priority_rank(TaskKind.VIDEO, "video_first"), task_priority_rank(TaskKind.PPT, "video_first"))
         self.assertLess(task_priority_rank(TaskKind.PPT, "ppt_first"), task_priority_rank(TaskKind.VIDEO, "ppt_first"))
         self.assertEqual(

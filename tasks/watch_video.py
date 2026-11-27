@@ -141,17 +141,35 @@ class VideoWatcher(BaseTask):
         return False
 
     def _is_page_marked_completed(self, driver: WebDriver) -> bool:
-        """检查雨课堂视频页顶栏/状态栏是否已明确显示完成。"""
-        for selector in SELECTORS.video_progress_text_selectors:
-            try:
-                elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                for el in elements:
-                    text = (el.text or "").strip()
-                    if any(kw in text for kw in ("已完成", "100%", "完成度：100", "完成度: 100")):
-                        return True
-            except WebDriverException:
-                continue
-        return False
+        """检查雨课堂当前视频页顶栏/状态栏是否已明确显示 100% 完成（排除左侧目录栏与其他未满百分比）。"""
+        try:
+            return bool(
+                driver.execute_script(
+                    r"""
+                    const selectors = arguments[0];
+                    for (const sel of selectors) {
+                      for (const el of document.querySelectorAll(sel)) {
+                        // 排除左侧章节目录栏，防止其他已看完章节的勾号干扰当前视频判断
+                        if (el.closest('#chapter-section, .section-fl, aside, [class*="sidebar"], [class*="chapter-list"]')) continue;
+                        const r = el.getBoundingClientRect();
+                        if (r.width <= 0 || r.height <= 0) continue;
+                        const txt = (el.innerText || '').replace(/\s+/g, ' ').trim();
+                        if (!txt) continue;
+                        // 若带有小于 100% 的百分比（如 “已完成 34%”、“完成度：34%”），明确尚未完成
+                        const pct = txt.match(/(\d{1,3}(?:\.\d+)?)\s*%/);
+                        if (pct && Number(pct[1]) < 99.9) continue;
+                        if (txt === '已完成' || txt.includes('100%') || /完成度[:：]?\s*100/.test(txt)) {
+                          return true;
+                        }
+                      }
+                    }
+                    return false;
+                    """,
+                    list(SELECTORS.video_progress_text_selectors),
+                )
+            )
+        except WebDriverException:
+            return False
 
     def _ensure_muted(self, driver: WebDriver) -> None:
         """将 video 设为静音，避免后台刷课时出声。"""
