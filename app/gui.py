@@ -14,7 +14,7 @@ from typing import Optional
 
 import customtkinter as ctk
 
-from app.config import ALLOWED_BROWSERS, ALLOWED_VIDEO_SPEEDS, AppConfig, load_config, save_config
+from app.config import ALLOWED_BROWSERS, ALLOWED_VIDEO_SPEEDS, SERVER_PRESETS, AppConfig, load_config, save_config
 from app.logger import LogMessage, setup_logger
 from core.auth import ensure_logged_in
 from core.browser import BrowserManager
@@ -64,8 +64,18 @@ class YuketangApp(ctk.CTk):
         row = 0
         row = self._add_section_title(left_panel, row, "1. 平台与浏览器设置")
 
+        self.server_preset_var = ctk.StringVar(value="雨课堂（标准版）")
+        ctk.CTkLabel(left_panel, text="服务器版本", anchor="w").grid(row=row, column=0, sticky="w", padx=8, pady=6)
+        ctk.CTkOptionMenu(
+            left_panel,
+            variable=self.server_preset_var,
+            values=list(SERVER_PRESETS.keys()),
+            command=self._on_server_preset_change,
+        ).grid(row=row, column=1, sticky="ew", padx=8, pady=6)
+        row += 1
+
         self.base_url_var = ctk.StringVar()
-        row = self._add_labeled_entry(left_panel, row, "雨课堂网址", self.base_url_var, placeholder="https://changjiang.yuketang.cn")
+        row = self._add_labeled_entry(left_panel, row, "雨课堂网址", self.base_url_var, placeholder="https://www.yuketang.cn/web")
 
         self.browser_var = ctk.StringVar(value="edge")
         ctk.CTkLabel(left_panel, text="浏览器类型", anchor="w").grid(row=row, column=0, sticky="w", padx=8, pady=6)
@@ -241,10 +251,22 @@ class YuketangApp(ctk.CTk):
     def _toggle_api_key_visibility(self) -> None:
         self.api_key_entry.configure(show="" if self.show_key_var.get() else "*")
 
+    def _on_server_preset_change(self, selected: str) -> None:
+        """切换服务器版本下拉框时自动填入对应官方网页版入口。"""
+        preset_url = SERVER_PRESETS.get(selected, "")
+        if preset_url:
+            self.base_url_var.set(preset_url)
+
     # ------------------------------------------------------------------
     # 配置双向同步
     # ------------------------------------------------------------------
     def _load_config_into_form(self, cfg: AppConfig) -> None:
+        matched_preset = "自定义网址"
+        for name, url in SERVER_PRESETS.items():
+            if url and cfg.base_url.rstrip("/") == url.rstrip("/"):
+                matched_preset = name
+                break
+        self.server_preset_var.set(matched_preset)
         self.base_url_var.set(cfg.base_url)
         self.browser_var.set(cfg.browser)
         self.courses_var.set("，".join(cfg.course_names))

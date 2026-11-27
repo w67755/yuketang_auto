@@ -26,8 +26,9 @@ class SelectorRegistry:
         "oauth",
     )
     course_page_url_keywords: Tuple[str, ...] = (
-        "/studentLog/",
-        "/studentCourse/",
+        "/studentlog/",
+        "/studentcourse/",
+        "/studentcards/",
         "/pro/lms/",
         "/lms#",
         "/studycontent",
@@ -44,6 +45,8 @@ class SelectorRegistry:
         "/presentation/",
         "/slide/",
         "/cards/",
+        "/studentcards/",
+        "/cloud/student/download/",
         "/courseware/",
         "type=ppt",
         "leaf_type=1",

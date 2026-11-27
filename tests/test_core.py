@@ -21,7 +21,7 @@ class TestCoreLogic(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = Path(tmp) / "config.json"
             cfg = AppConfig(
-                base_url="changjiang.yuketang.cn/",
+                base_url="www.yuketang.cn/web/",
                 browser="invalid",
                 video_speed="16.0",  # 非法高倍速应回退到安全的 2.0
                 ppt_dwell_min=7.0,
@@ -31,7 +31,7 @@ class TestCoreLogic(unittest.TestCase):
             save_config(cfg, cfg_path)
             loaded = load_config(cfg_path)
 
-            self.assertEqual(loaded.base_url, "https://changjiang.yuketang.cn")
+            self.assertEqual(loaded.base_url, "https://www.yuketang.cn/web")
             self.assertEqual(loaded.browser, "edge")
             self.assertEqual(loaded.video_speed, "2.0")
             self.assertEqual(loaded.ppt_dwell_min, 7.0)
