@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
+import sys
 import threading
 import time
 from pathlib import Path
@@ -48,6 +50,23 @@ ANTI_BLUR_JS = r"""
   };
 })();
 """
+
+
+# Windows 电源执行状态标志（与视频播放器同原理，阻止无人值守时进入屏保或系统睡眠）
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
+
+
+def set_system_awake(awake: bool) -> None:
+    """开启或释放 Windows 防休眠/防屏保状态（非 Windows 平台安全忽略）。"""
+    if sys.platform != "win32":
+        return
+    try:
+        flags = (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED) if awake else ES_CONTINUOUS
+        ctypes.windll.kernel32.SetThreadExecutionState(flags)
+    except Exception:
+        pass
 
 
 def interruptible_sleep(seconds: float, stop_event: threading.Event, step: float = 0.25) -> bool:

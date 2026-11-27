@@ -26,7 +26,7 @@ from app.config import (
 )
 from app.logger import LogMessage, setup_logger
 from core.auth import ensure_logged_in
-from core.browser import BrowserManager
+from core.browser import BrowserManager, set_system_awake
 from core.diagnostics import capture_diagnostics
 from core.scheduler import CourseScheduler
 
@@ -199,6 +199,12 @@ class YuketangApp(ctk.CTk):
 
         self.diag_on_err_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(left_panel, text="任务异常时自动保存截图与页面 DOM 诊断", variable=self.diag_on_err_var).grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=8, pady=4
+        )
+        row += 1
+
+        self.prevent_sleep_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(left_panel, text="刷课期间防屏保/防睡眠（结束后自动恢复）", variable=self.prevent_sleep_var).grid(
             row=row, column=0, columnspan=2, sticky="w", padx=8, pady=(2, 10)
         )
 
@@ -320,6 +326,7 @@ class YuketangApp(ctk.CTk):
         self.model_var.set(cfg.deepseek_model)
         self.auto_submit_var.set(cfg.auto_submit_quiz)
         self.diag_on_err_var.set(cfg.save_diagnostics_on_error)
+        self.prevent_sleep_var.set(cfg.prevent_sleep)
 
     def _collect_config_from_form(self) -> AppConfig:
         raw_courses = self.courses_var.get().replace("，", ",").replace("\n", ",")
@@ -359,6 +366,7 @@ class YuketangApp(ctk.CTk):
             deepseek_base_url=self.config_data.deepseek_base_url,
             auto_submit_quiz=self.auto_submit_var.get(),
             save_diagnostics_on_error=self.diag_on_err_var.get(),
+            prevent_sleep=self.prevent_sleep_var.get(),
         ).normalized()
         self.config_data = cfg
         return cfg
@@ -403,6 +411,9 @@ class YuketangApp(ctk.CTk):
         self._set_running_ui(True)
 
         def _worker() -> None:
+            if cfg.prevent_sleep:
+                set_system_awake(True)
+                self.logger.info("已开启系统防屏保/防睡眠保护（任务结束后自动恢复正常电源策略）。")
             try:
                 if self.browser is None:
                     self.browser = BrowserManager(cfg, self.logger)
@@ -420,6 +431,8 @@ class YuketangApp(ctk.CTk):
             except Exception as exc:
                 self.logger.exception("运行过程中出现未捕获异常：%s", exc)
             finally:
+                if cfg.prevent_sleep:
+                    set_system_awake(False)
                 self.after(0, lambda: self._set_running_ui(False))
 
         self.worker_thread = threading.Thread(target=_worker, daemon=True)

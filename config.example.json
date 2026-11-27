@@ -19,5 +19,6 @@
   "deepseek_model": "deepseek-v4.1-flash",
   "deepseek_base_url": "https://api.deepseek.com",
   "auto_submit_quiz": true,
-  "save_diagnostics_on_error": true
+  "save_diagnostics_on_error": true,
+  "prevent_sleep": true
 }

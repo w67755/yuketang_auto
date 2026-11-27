@@ -86,6 +86,7 @@ class AppConfig:
 
     # ---------- 诊断与容错 ----------
     save_diagnostics_on_error: bool = True
+    prevent_sleep: bool = True             # 刷课运行期间阻止 Windows 自动进入屏保/睡眠，任务结束自动恢复
 
     def normalized(self) -> "AppConfig":
         """清洗并校验配置边界，确保非法输入不会导致运行期崩溃。"""
