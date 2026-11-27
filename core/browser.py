@@ -106,7 +106,8 @@ class BrowserManager:
             driver = self._start_edge(profile_dir)
 
         driver.set_page_load_timeout(45)
-        driver.implicitly_wait(2)
+        # 必须设为 0：多选择器回退查找时若开启隐式等待，每个未命中选择器都会白白阻塞数秒，导致整体极慢
+        driver.implicitly_wait(0)
         self.driver = driver
 
         # 注册新文档加载前自动执行的防失焦脚本（CDP 协议，Edge 与 Chrome 均支持）

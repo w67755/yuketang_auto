@@ -91,27 +91,17 @@ class SelectorRegistry:
         "[class*='section-header']",
         ".chapter-title",
     )
-    # 单个学习任务条目（兼容 v2/web 学习日志卡片、ElementUI 卡片与 pro/lms 章节叶子节点）
+    # 单个学习任务条目（按实测雨课堂标准版 /v2/web/studentLog 优先排序，避免无效遍历）
     task_item_selectors: Tuple[str, ...] = (
-        ".study-unit",
+        "section.activity__wrap",
         ".activity__wrap",
-        ".activity-box",
-        ".activity-item",
-        ".log-item",
-        ".log-card",
-        ".content-box",
-        ".card-box",
+        ".study-unit",
         ".leaf-detail",
         ".chapter-list .leaf",
-        "[class*='activity']",
-        "[class*='study-unit']",
-        "[class*='student-log'] .el-card",
-        ".el-timeline-item__content",
-        ".el-card",
         "[class*='leaf-item']",
         "[class*='unit-item']",
-        "[class*='content-item']",
-        "li[class*='item']",
+        ".el-timeline-item__content",
+        ".log-item",
     )
     # 用于排除导航栏/筛选栏等非学习任务节点的关键词
     ignored_nav_texts: Tuple[str, ...] = (

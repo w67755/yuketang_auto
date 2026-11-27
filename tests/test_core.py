@@ -7,7 +7,12 @@ import unittest
 from pathlib import Path
 
 from app.config import AppConfig, load_config, save_config
-from core.scheduler import classify_task_text, detect_page_task_kind
+from core.scheduler import (
+    classify_task_text,
+    detect_page_task_kind,
+    is_collapsible_bundle_text,
+    is_progress_fraction_completed,
+)
 from tasks.auto_quiz import detect_question_type, match_option_indices
 from tasks.base import TaskKind
 from tasks.deepseek_client import build_question_prompt, parse_answer_list
@@ -72,8 +77,12 @@ class TestCoreLogic(unittest.TestCase):
 
     def test_task_kind_detection(self) -> None:
         self.assertEqual(classify_task_text("第四讲文化自信 课件 PPT 未完成"), TaskKind.PPT)
+        self.assertEqual(classify_task_text("第五讲 双碳行动中的中国与世界 0/75 学习进度"), TaskKind.PPT)
         self.assertEqual(classify_task_text("1.2 课程视频 12:30"), TaskKind.VIDEO)
         self.assertEqual(classify_task_text("第一章随堂测验"), TaskKind.QUIZ)
+        self.assertTrue(is_progress_fraction_completed("第四讲文化自信与文化强国 69/69 学习进度"))
+        self.assertFalse(is_progress_fraction_completed("第五讲 双碳行动中的中国与世界 0/75 学习进度"))
+        self.assertTrue(is_collapsible_bundle_text("视频学习 等 包含3章，0小节，共计9个学习单元 展开 进行中"))
         self.assertEqual(
             detect_page_task_kind("https://changjiang.yuketang.cn/v2/web/studentLog/123", "您还有以下页面未看 18"),
             TaskKind.PPT,

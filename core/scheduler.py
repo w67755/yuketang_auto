@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -75,6 +76,24 @@ def detect_page_task_kind(url: str, page_text: str = "", has_video: bool = False
     return TaskKind.UNKNOWN
 
 
+def is_progress_fraction_completed(text: str) -> bool:
+    """判断任务卡片文本中的“分子/分母”进度是否已达 100%（例如 '69/69 学习进度'、'36/36'、'1/1'）。"""
+    if not text:
+        return False
+    for match in re.finditer(r"(\d{1,4})\s*/\s*(\d{1,4})", text):
+        done, total = int(match.group(1)), int(match.group(2))
+        if total > 0 and done >= total:
+            return True
+    return False
+
+
+def is_collapsible_bundle_text(text: str) -> bool:
+    """判断是否为折叠合集卡片头（例如 '视频学习 等 包含3章，0小节，共计9个学习单元 展开 进行中'）。"""
+    if not text:
+        return False
+    return bool(re.search(r"包含\s*\d+\s*章.*学习单元", text))
+
+
 def classify_task_text(text: str) -> TaskKind:
     """根据课程目录中任务条目的标题与角标文本初步判定任务类型。"""
     if not text:
@@ -85,6 +104,9 @@ def classify_task_text(text: str) -> TaskKind:
         return TaskKind.PPT
     if any(kw in text for kw in SELECTORS.video_type_keywords):
         return TaskKind.VIDEO
+    # 标准版雨课堂的课件卡片常以图标标注“课件”，正文呈现为 “第X讲... 0/75 学习进度”
+    if "学习进度" in text and re.search(r"\d+\s*/\s*\d+", text):
+        return TaskKind.PPT
     return TaskKind.UNKNOWN
 
 
@@ -250,7 +272,7 @@ class CourseScheduler:
             interruptible_sleep(1.0, self.stop_event)
 
     def _expand_collapsed_chapters(self, driver: WebDriver) -> None:
-        """展开折叠的章节目录，确保所有子任务节点都能被扫描到。"""
+        """展开折叠的章节目录与学习日志中的「展开」合集卡片，确保所有子任务节点可见。"""
         for selector in SELECTORS.chapter_expand_selectors:
             try:
                 headers = driver.find_elements(By.CSS_SELECTOR, selector)
@@ -260,6 +282,19 @@ class CourseScheduler:
                         time.sleep(0.15)
             except WebDriverException:
                 continue
+
+        # 展开学习日志中类似 “视频学习 等 包含3章，共计9个学习单元 ⌄ 展开” 的合集按钮
+        try:
+            expand_btns = driver.find_elements(
+                By.XPATH,
+                "//*[self::span or self::a or self::button or self::div][normalize-space()='展开']",
+            )
+            for btn in expand_btns:
+                if btn.is_displayed():
+                    driver.execute_script("arguments[0].click();", btn)
+                    time.sleep(0.35)
+        except WebDriverException:
+            pass
 
     def _find_next_pending_task(
         self,
@@ -288,18 +323,17 @@ class CourseScheduler:
                 if raw_text in SELECTORS.ignored_nav_texts:
                     continue
 
-                # 跳过明确标注“已完成 / 100% / 已提交”的条目
+                # 跳过多章合集父卡片头（已在 _expand_collapsed_chapters 中展开其子单元）
+                if is_collapsible_bundle_text(raw_text):
+                    continue
+
+                # 跳过明确标注“已完成 / 100% / 已提交”或进度已满（如 69/69 学习进度）的条目
                 if any(done_kw in raw_text for done_kw in SELECTORS.completed_keywords):
+                    continue
+                if is_progress_fraction_completed(raw_text):
                     continue
 
                 guessed_kind = classify_task_text(raw_text)
-                # 对通用容器（如 .el-card / li）要求文本中包含明确的任务特征，避免误点普通提示卡片
-                is_generic_selector = selector in (".el-card", "li[class*='item']", "[class*='content-item']")
-                if is_generic_selector and guessed_kind == TaskKind.UNKNOWN and not any(
-                    hint in raw_text for hint in ("未完成", "未读", "未看", "进行中", "共", "页", "讲")
-                ):
-                    continue
-
                 if not self._is_kind_enabled(guessed_kind):
                     continue
 
