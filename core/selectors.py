@@ -91,17 +91,23 @@ class SelectorRegistry:
         "[class*='section-header']",
         ".chapter-title",
     )
-    # 单个学习任务条目（按实测雨课堂标准版 /v2/web/studentLog 优先排序，避免无效遍历）
+    # 单个学习任务条目（兼顾学习日志 /v2/web/studentLog 与学习内容 /pro/lms/.../studycontent）
     task_item_selectors: Tuple[str, ...] = (
         "section.activity__wrap",
-        ".activity__wrap",
-        ".study-unit",
         ".leaf-detail",
+        ".study-unit",
+        ".section-list .leaf",
         ".chapter-list .leaf",
         "[class*='leaf-item']",
+        "[class*='leaf-box']",
         "[class*='unit-item']",
         ".el-timeline-item__content",
         ".log-item",
+    )
+    # 指向“学习内容（MOOC 章节与视频单元）”的内嵌 iframe 选择器
+    study_content_iframe_selectors: Tuple[str, ...] = (
+        "iframe.tab-pane-content-iframe",
+        "iframe[src*='studycontent']",
     )
     # 用于排除导航栏/筛选栏等非学习任务节点的关键词
     ignored_nav_texts: Tuple[str, ...] = (

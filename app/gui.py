@@ -19,6 +19,7 @@ from app.config import (
     ALLOWED_VIDEO_SPEEDS,
     DEEPSEEK_MODEL_PRESETS,
     SERVER_PRESETS,
+    TASK_ORDER_LABELS,
     AppConfig,
     load_config,
     save_config,
@@ -120,6 +121,15 @@ class YuketangApp(ctk.CTk):
         ctk.CTkCheckBox(switch_frame, text="自动看视频", variable=self.enable_video_var).pack(side="left", padx=(0, 14))
         ctk.CTkCheckBox(switch_frame, text="自动看课件", variable=self.enable_ppt_var).pack(side="left", padx=(0, 14))
         ctk.CTkCheckBox(switch_frame, text="AI 自动做题", variable=self.enable_quiz_var).pack(side="left")
+        row += 1
+
+        self.task_order_var = ctk.StringVar(value="先视频 → 再课件 → 后做题")
+        ctk.CTkLabel(left_panel, text="执行优先顺序", anchor="w").grid(row=row, column=0, sticky="w", padx=8, pady=6)
+        ctk.CTkOptionMenu(
+            left_panel,
+            variable=self.task_order_var,
+            values=list(TASK_ORDER_LABELS.keys()),
+        ).grid(row=row, column=1, sticky="ew", padx=8, pady=6)
         row += 1
 
         # 第三区：视频与课件策略
@@ -296,6 +306,11 @@ class YuketangApp(ctk.CTk):
         self.enable_video_var.set(cfg.enable_video)
         self.enable_ppt_var.set(cfg.enable_ppt)
         self.enable_quiz_var.set(cfg.enable_quiz)
+        order_label = next(
+            (label for label, code in TASK_ORDER_LABELS.items() if code == cfg.task_order),
+            "先视频 → 再课件 → 后做题",
+        )
+        self.task_order_var.set(order_label)
         self.video_speed_var.set(cfg.video_speed)
         self.video_mute_var.set(cfg.video_mute)
         self.ppt_min_var.set(str(cfg.ppt_dwell_min))
@@ -332,6 +347,7 @@ class YuketangApp(ctk.CTk):
             enable_video=self.enable_video_var.get(),
             enable_ppt=self.enable_ppt_var.get(),
             enable_quiz=self.enable_quiz_var.get(),
+            task_order=TASK_ORDER_LABELS.get(self.task_order_var.get(), "video_first"),
             video_speed=self.video_speed_var.get(),
             video_mute=self.video_mute_var.get(),
             ppt_dwell_min=_parse_float(self.ppt_min_var.get(), 5.0),

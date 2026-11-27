@@ -12,6 +12,7 @@ from core.scheduler import (
     detect_page_task_kind,
     is_collapsible_bundle_text,
     is_progress_fraction_completed,
+    task_priority_rank,
 )
 from tasks.auto_quiz import detect_question_type, match_option_indices
 from tasks.base import TaskKind
@@ -85,6 +86,8 @@ class TestCoreLogic(unittest.TestCase):
         self.assertTrue(is_progress_fraction_completed("第四讲文化自信与文化强国 69/69 学习进度"))
         self.assertFalse(is_progress_fraction_completed("第五讲 双碳行动中的中国与世界 0/75 学习进度"))
         self.assertTrue(is_collapsible_bundle_text("视频学习 等 包含3章，0小节，共计9个学习单元 展开 进行中"))
+        self.assertLess(task_priority_rank(TaskKind.VIDEO, "video_first"), task_priority_rank(TaskKind.PPT, "video_first"))
+        self.assertLess(task_priority_rank(TaskKind.PPT, "ppt_first"), task_priority_rank(TaskKind.VIDEO, "ppt_first"))
         self.assertEqual(
             detect_page_task_kind("https://changjiang.yuketang.cn/v2/web/studentLog/123", "您还有以下页面未看 18"),
             TaskKind.PPT,

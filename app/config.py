@@ -36,6 +36,13 @@ DEEPSEEK_MODEL_PRESETS = (
     "deepseek-reasoner",
 )
 
+# 任务执行优先级预设
+TASK_ORDER_LABELS = {
+    "先视频 → 再课件 → 后做题": "video_first",
+    "先课件 → 再视频 → 后做题": "ppt_first",
+}
+ALLOWED_TASK_ORDERS = tuple(TASK_ORDER_LABELS.values())
+
 # 雨课堂原生支持的合法视频倍速集合（避免超高倍速导致进度不计分）
 ALLOWED_VIDEO_SPEEDS = ("1.0", "1.5", "2.0")
 ALLOWED_BROWSERS = ("edge", "chrome")
@@ -59,6 +66,7 @@ class AppConfig:
     enable_video: bool = True
     enable_ppt: bool = True
     enable_quiz: bool = True
+    task_order: str = "video_first"        # video_first（先视频后课件） / ppt_first（先课件后视频）
 
     # ---------- 看视频配置 ----------
     video_speed: str = "2.0"               # 仅允许雨课堂原生倍速：1.0 / 1.5 / 2.0
@@ -92,6 +100,10 @@ class AppConfig:
         self.video_speed = str(self.video_speed).strip()
         if self.video_speed not in ALLOWED_VIDEO_SPEEDS:
             self.video_speed = "2.0"
+
+        self.task_order = (self.task_order or "video_first").strip()
+        if self.task_order not in ALLOWED_TASK_ORDERS:
+            self.task_order = "video_first"
 
         # 保障课件随机停留区间合理（至少 1 秒，且 min <= max）
         self.ppt_dwell_min = max(1.0, float(self.ppt_dwell_min))

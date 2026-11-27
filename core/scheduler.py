@@ -110,6 +110,15 @@ def classify_task_text(text: str) -> TaskKind:
     return TaskKind.UNKNOWN
 
 
+def task_priority_rank(kind: TaskKind, task_order: str) -> int:
+    """根据配置的优先顺序返回任务排序权重（值越小越优先执行）。"""
+    if task_order == "ppt_first":
+        order_map = {TaskKind.PPT: 0, TaskKind.VIDEO: 1, TaskKind.QUIZ: 2, TaskKind.UNKNOWN: 3}
+    else:
+        order_map = {TaskKind.VIDEO: 0, TaskKind.PPT: 1, TaskKind.QUIZ: 2, TaskKind.UNKNOWN: 3}
+    return order_map.get(kind, 3)
+
+
 class CourseScheduler:
     """雨课堂单浏览器顺序调度器（视频 + 课件 + DeepSeek 做题）。"""
 
@@ -185,11 +194,64 @@ class CourseScheduler:
             summary.record(result)
             return
 
-        # 否则视为课程目录 / 学习日志列表页：等待异步列表渲染完成，再展开章节并扫描
+        # 否则视为课程目录 / 学习日志列表页：
+        # 注意：标准版雨课堂中，「视频/MOOC章节」通常位于「学习内容」iframe（/pro/lms/.../studycontent），
+        # 而「课件」位于「学习日志」（/v2/web/studentLog/...）。此处按 task_order 自动串联两个区域！
+        student_log_url = driver.current_url or ""
+        study_content_url = self._detect_study_content_url(driver)
+
+        if study_content_url and "/studycontent" not in student_log_url.lower():
+            phases: List[Tuple[str, str]] = []
+            # 根据用户设置的优先顺序编排「学习内容（视频/章节）」与「学习日志（课件）」的执行次序
+            need_study_content = self.config.enable_video or self.config.enable_quiz
+            need_student_log = self.config.enable_ppt or self.config.enable_video or self.config.enable_quiz
+
+            if self.config.task_order == "ppt_first":
+                if need_student_log:
+                    phases.append((f"{course_label} · 学习日志（课件）", student_log_url))
+                if need_study_content:
+                    phases.append((f"{course_label} · 学习内容（视频/章节）", study_content_url))
+            else:
+                if need_study_content:
+                    phases.append((f"{course_label} · 学习内容（视频/章节）", study_content_url))
+                if need_student_log:
+                    phases.append((f"{course_label} · 学习日志（课件）", student_log_url))
+
+            self.logger.info(
+                "检测到该课程同时包含「学习内容（视频/章节）」与「学习日志（课件）」，将按配置顺序依次处理：%s",
+                " -> ".join(name for name, _ in phases),
+            )
+            for phase_name, phase_url in phases:
+                if self.stop_event.is_set():
+                    break
+                if driver.current_url != phase_url:
+                    driver.get(phase_url)
+                    if not interruptible_sleep(2.5, self.stop_event):
+                        break
+                self._scan_and_run_list_page(summary, course_label=phase_name)
+            return
+
+        self._scan_and_run_list_page(summary, course_label=course_label)
+
+    def _detect_study_content_url(self, driver: WebDriver) -> Optional[str]:
+        """提取雨课堂课程页中指向「学习内容（/pro/lms/.../studycontent）」的同源 URL。"""
+        for selector in SELECTORS.study_content_iframe_selectors:
+            try:
+                for frame in driver.find_elements(By.CSS_SELECTOR, selector):
+                    src = (frame.get_attribute("src") or "").strip()
+                    if src and "studycontent" in src.lower():
+                        return src
+            except WebDriverException:
+                continue
+        return None
+
+    def _scan_and_run_list_page(self, summary: RunSummary, course_label: str) -> None:
+        """在单个列表页（学习内容页或学习日志页）内按优先级扫描并依次完成未完成任务。"""
+        driver = self.browser.ensure_started()
         self.logger.info("正在扫描《%s》中的未完成任务点...", course_label)
-        interruptible_sleep(2.5, self.stop_event)
+        interruptible_sleep(2.0, self.stop_event)
         self._expand_collapsed_chapters(driver)
-        interruptible_sleep(1.5, self.stop_event)
+        interruptible_sleep(1.2, self.stop_event)
 
         course_list_handle = driver.current_window_handle
         course_list_url = driver.current_url
@@ -202,7 +264,7 @@ class CourseScheduler:
             if self.stop_event.is_set():
                 break
 
-            # 确保每次扫描都回到课程目录主标签页
+            # 确保每次扫描都回到当前列表主标签页
             self.browser.close_extra_tabs(course_list_handle)
             if driver.current_url != course_list_url:
                 driver.get(course_list_url)
@@ -212,7 +274,6 @@ class CourseScheduler:
 
             next_candidate = self._find_next_pending_task(driver, attempted_keys)
             if next_candidate is None:
-                # 若一轮都没识别到任何任务点，自动保存诊断快照方便排查页面 DOM 结构
                 if not attempted_keys:
                     self.logger.warning(
                         "在《%s》当前页面未识别到未完成任务点（可能全部已完成，或该页 DOM 选择器需适配）。",
@@ -256,7 +317,6 @@ class CourseScheduler:
                 driver.switch_to.window(new_handles[-1])
                 interruptible_sleep(1.5, self.stop_event)
             elif driver.current_url == before_url:
-                # 若 URL 未变化，再宽容等待 1.5 秒以适配 SPA 弹窗型课件/视频
                 interruptible_sleep(1.5, self.stop_event)
 
             self.browser.inject_anti_blur_now()
@@ -267,7 +327,7 @@ class CourseScheduler:
             result = self._execute_single_task(actual_kind, title=task_title)
             summary.record(result)
 
-            # 任务完成后清理临时标签页，回到课程列表继续下一项
+            # 任务完成后清理临时标签页，回到列表继续下一项
             self.browser.close_extra_tabs(course_list_handle)
             interruptible_sleep(1.0, self.stop_event)
 
@@ -301,15 +361,18 @@ class CourseScheduler:
         driver: WebDriver,
         attempted_keys: set[str],
     ) -> Optional[Tuple[str, str, TaskKind, object]]:
-        """在当前课程目录 / 学习日志 DOM 中找到下一个尚未完成且未被尝试过的任务项。"""
-        # 1. 先按已知任务卡片选择器匹配
+        """在当前列表 DOM 中收集未完成任务，并按 `task_order` 优先级返回最应先执行的一项。"""
+        candidates: List[Tuple[int, int, str, str, TaskKind, object]] = []
+        seq = 0
+
+        # 1. 先按已知任务卡片选择器收集候选
         for selector in SELECTORS.task_item_selectors:
             try:
                 items = driver.find_elements(By.CSS_SELECTOR, selector)
             except WebDriverException:
                 continue
 
-            for idx, item in enumerate(items):
+            for item in items:
                 try:
                     if not item.is_displayed():
                         continue
@@ -319,15 +382,10 @@ class CourseScheduler:
                 except StaleElementReferenceException:
                     continue
 
-                # 过滤顶部导航栏/标签页等非任务卡片文本
                 if raw_text in SELECTORS.ignored_nav_texts:
                     continue
-
-                # 跳过多章合集父卡片头（已在 _expand_collapsed_chapters 中展开其子单元）
                 if is_collapsible_bundle_text(raw_text):
                     continue
-
-                # 跳过明确标注“已完成 / 100% / 已提交”或进度已满（如 69/69 学习进度）的条目
                 if any(done_kw in raw_text for done_kw in SELECTORS.completed_keywords):
                     continue
                 if is_progress_fraction_completed(raw_text):
@@ -338,19 +396,26 @@ class CourseScheduler:
                     continue
 
                 short_title = raw_text[:45]
-                # 归一化任务指纹时去掉动态进度数字（如 0/25 -> 10/25），防止同一课件因进度微变被反复重入
                 stable_title = re.sub(r"\d+\s*/\s*\d+\s*学习进度", "", short_title).strip()
                 task_key = f"{selector}:{stable_title}"
                 if task_key in attempted_keys:
                     continue
 
+                rank = task_priority_rank(guessed_kind, self.config.task_order)
+                candidates.append((rank, seq, task_key, short_title, guessed_kind, item))
+                seq += 1
+
+            # 首个有效选择器已找到候选时即可按优先级排序返回，避免重复匹配嵌套子节点
+            if candidates:
+                candidates.sort(key=lambda c: (c[0], c[1]))
+                _, _, task_key, short_title, guessed_kind, item = candidates[0]
                 return task_key, short_title, guessed_kind, item
 
-        # 2. 语义兜底：针对标准版雨课堂 /v2/web/studentLog/ 的动态类名卡片，按最小包含块匹配
+        # 2. 语义兜底：针对动态类名页面按最小包含块匹配并按优先级排序
         try:
             fallback_nodes = driver.execute_script(
                 """
-                const kws = ['课件', 'PPT', '视频', '录播', '习题', '作业', '测验', '预习', '未完成', '未读', '未看', '讲'];
+                const kws = ['课件', 'PPT', '视频', '录播', '习题', '作业', '测验', '预习', '未完成', '未读', '未看', '未开始', '进行中', '讲'];
                 const done = ['已完成', '已读', '已看完', '100%', '已提交', '已作答'];
                 const candidates = Array.from(document.querySelectorAll('div, li, section, article, a'));
                 const matched = [];
@@ -361,7 +426,6 @@ class CourseScheduler:
                   if (txt.length < 6 || txt.length > 260) continue;
                   if (done.some((d) => txt.includes(d))) continue;
                   if (!kws.some((k) => txt.includes(k))) continue;
-                  // 跳过包裹多个子卡片的大父容器：只保留本身尽量紧凑的卡片层
                   const hasChildMatch = Array.from(el.children).some((c) => {
                     const ct = (c.innerText || '').replace(/\\s+/g, ' ').trim();
                     return ct.length >= 6 && kws.some((k) => ct.includes(k)) && c.getBoundingClientRect().height >= 28;
@@ -375,14 +439,23 @@ class CourseScheduler:
                 raw_text = " ".join((node.text or "").split())
                 if not raw_text or raw_text in SELECTORS.ignored_nav_texts:
                     continue
+                if is_collapsible_bundle_text(raw_text) or is_progress_fraction_completed(raw_text):
+                    continue
                 guessed_kind = classify_task_text(raw_text)
                 if not self._is_kind_enabled(guessed_kind):
                     continue
                 short_title = raw_text[:45]
-                task_key = f"semantic#{idx}:{short_title}"
+                stable_title = re.sub(r"\d+\s*/\s*\d+\s*学习进度", "", short_title).strip()
+                task_key = f"semantic:{stable_title}"
                 if task_key in attempted_keys:
                     continue
-                return task_key, short_title, guessed_kind, node
+                rank = task_priority_rank(guessed_kind, self.config.task_order)
+                candidates.append((rank, idx, task_key, short_title, guessed_kind, node))
+
+            if candidates:
+                candidates.sort(key=lambda c: (c[0], c[1]))
+                _, _, task_key, short_title, guessed_kind, item = candidates[0]
+                return task_key, short_title, guessed_kind, item
         except WebDriverException:
             pass
 
