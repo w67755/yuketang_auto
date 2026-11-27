@@ -1,0 +1,5 @@
+# 强制 Windows 批处理脚本始终保持 CRLF 换行，防止 cmd.exe 解析错位
+*.bat text eol=crlf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
