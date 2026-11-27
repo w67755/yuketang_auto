@@ -85,6 +85,10 @@ class TestCoreLogic(unittest.TestCase):
         self.assertEqual(classify_task_text("第一章随堂测验"), TaskKind.QUIZ)
         self.assertTrue(is_progress_fraction_completed("第四讲文化自信与文化强国 69/69 学习进度"))
         self.assertFalse(is_progress_fraction_completed("第五讲 双碳行动中的中国与世界 0/75 学习进度"))
+        # 截止日期 “2027-01-31/23:59” 不应被误判为 31/23 已完成
+        self.assertFalse(is_progress_fraction_completed("第五讲双碳行动中的中国与世界 请在2027-01-31/23:59前完成学习 未开始"))
+        self.assertFalse(is_progress_fraction_completed("视频 第七讲数字中国与科技创新 考核截止时间: 2027-01-31/23:59/周日 未开始"))
+        self.assertFalse(is_progress_fraction_completed("第五讲 双碳行动 请在2027-01-31/23:59前完成学习 进行中(70/75)"))
         self.assertTrue(is_collapsible_bundle_text("视频学习 等 包含3章，0小节，共计9个学习单元 展开 进行中"))
         self.assertLess(task_priority_rank(TaskKind.VIDEO, "video_first"), task_priority_rank(TaskKind.PPT, "video_first"))
         self.assertLess(task_priority_rank(TaskKind.PPT, "ppt_first"), task_priority_rank(TaskKind.VIDEO, "ppt_first"))

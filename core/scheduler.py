@@ -76,11 +76,23 @@ def detect_page_task_kind(url: str, page_text: str = "", has_video: bool = False
     return TaskKind.UNKNOWN
 
 
+def strip_datetime_noise(text: str) -> str:
+    """移除文本中的日期/时间片段，避免 “2027-01-31/23:59” 被误识别为 “31/23” 的进度分数。"""
+    if not text:
+        return ""
+    cleaned = re.sub(r"\d{4}-\d{1,2}-\d{1,2}(?:\s*/\s*|\s+)?(?:\d{1,2}:\d{2}(?::\d{2})?)?", " ", text)
+    cleaned = re.sub(r"\d{1,2}:\d{2}(?::\d{2})?", " ", cleaned)
+    return cleaned
+
+
 def is_progress_fraction_completed(text: str) -> bool:
-    """判断任务卡片文本中的“分子/分母”进度是否已达 100%（例如 '69/69 学习进度'、'36/36'、'1/1'）。"""
+    """判断任务卡片文本中的“分子/分母”进度是否已达 100%（例如 '69/69 学习进度'、'36/36'、'1/1'）。
+
+    注意：会先剔除截止日期（如 '请在2027-01-31/23:59前完成学习'），防止日期被误判为已完成进度。
+    """
     if not text:
         return False
-    for match in re.finditer(r"(\d{1,4})\s*/\s*(\d{1,4})", text):
+    for match in re.finditer(r"(\d{1,4})\s*/\s*(\d{1,4})", strip_datetime_noise(text)):
         done, total = int(match.group(1)), int(match.group(2))
         if total > 0 and done >= total:
             return True
@@ -530,6 +542,12 @@ class CourseScheduler:
                     const cls = typeof iconEl.className === 'string' ? iconEl.className : (iconEl.className && iconEl.className.baseVal) || '';
                     if (cls) iconHints.push(cls);
                   }
+                  for (const img of picked.querySelectorAll('img')) {
+                    iconHints.push(img.getAttribute('src') || '');
+                  }
+                  // 行首图标外层 HTML 片段（用于区分“视频图标”与“P 课件图标”）
+                  const firstIcon = picked.querySelector('[class*="icon"], i, svg, img');
+                  if (firstIcon) iconHints.push((firstIcon.outerHTML || '').slice(0, 240));
                   // 优先把行内主标题区域作为可点击目标（点击标题最稳，不会误触提示 tooltip）
                   const clickTarget = picked.querySelector('[class*="title"], [class*="name"], .leaf-detail, a') || picked;
                   results.push({
@@ -585,12 +603,12 @@ class CourseScheduler:
         # 1. 带分数进度（如 “进行中(70/75)”）明确是课件/PPT
         if re.search(r"\(\s*\d+\s*/\s*\d+\s*\)", status_text):
             return TaskKind.PPT
-        # 2. 图标类名/SVG 名称特征（雨课堂常用 icon-shipin / icon-tuwen / icon-kejian / icon-zuoye）
-        if any(k in icon_hint for k in ("shipin", "video", "play", "mooc")):
-            return TaskKind.VIDEO
-        if any(k in icon_hint for k in ("ppt", "kejian", "tuwen", "doc", "card", "slide")):
+        # 2. 图标类名/SVG 名称特征（先判课件，再判视频；避免 "display"/"document" 等通用词误命中）
+        if any(k in icon_hint for k in ("ppt", "kejian", "slide", "courseware")):
             return TaskKind.PPT
-        if any(k in icon_hint for k in ("zuoye", "homework", "exam", "quiz", "paper", "xiti")):
+        if any(k in icon_hint for k in ("shipin", "video", "mooc-video")):
+            return TaskKind.VIDEO
+        if any(k in icon_hint for k in ("zuoye", "homework", "exam", "quiz", "xiti")):
             return TaskKind.QUIZ
         # 3. 文本关键词回退（如 “小论文” / “心得体会” 归为习题/作业类，不误当视频）
         if any(k in raw_text for k in ("小论文", "心得", "作业", "习题", "测验", "考试")):
