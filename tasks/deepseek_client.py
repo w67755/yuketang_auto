@@ -95,14 +95,14 @@ class DeepSeekClient:
     def __init__(
         self,
         api_key: str,
-        model: str = "deepseek-v4-pro,deepseek-v4-flash",
+        model: str = "deepseek-v4.1-flash",
         base_url: str = "https://api.deepseek.com",
         timeout: int = 45,
         logger: logging.Logger | None = None,
     ) -> None:
         self.api_key = (api_key or "").strip()
-        raw_models = (model or "deepseek-v4-pro,deepseek-v4-flash").replace("，", ",")
-        self.models = [m.strip() for m in raw_models.split(",") if m.strip()] or ["deepseek-v4-pro", "deepseek-v4-flash"]
+        raw_models = (model or "deepseek-v4.1-flash").replace("，", ",")
+        self.models = [m.strip() for m in raw_models.split(",") if m.strip()] or ["deepseek-v4.1-flash"]
         self.model = self.models[0]
         self.endpoint = f"{(base_url or 'https://api.deepseek.com').rstrip('/')}/chat/completions"
         self.timeout = timeout

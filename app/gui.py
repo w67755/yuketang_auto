@@ -172,7 +172,7 @@ class YuketangApp(ctk.CTk):
         ).grid(row=0, column=1, padx=(6, 0))
         row += 1
 
-        self.model_var = ctk.StringVar(value="deepseek-v4-pro,deepseek-v4-flash")
+        self.model_var = ctk.StringVar(value="deepseek-v4.1-flash")
         ctk.CTkLabel(left_panel, text="DeepSeek 模型", anchor="w").grid(row=row, column=0, sticky="w", padx=8, pady=6)
         ctk.CTkComboBox(
             left_panel,
