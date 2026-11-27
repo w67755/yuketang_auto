@@ -189,52 +189,72 @@ class VideoWatcher(BaseTask):
             pass
 
     def _apply_native_speed(self, driver: WebDriver, target_speed: str) -> None:
-        """优先通过雨课堂原生倍速菜单切换倍速；仅允许 1.0/1.5/2.0。"""
+        """优先通过雨课堂原生倍速菜单切换倍速；仅允许 1.0/1.5/2.0。
+
+        注意：雨课堂播放器的 `xt-speedlist` 在未悬停时处于 CSS 隐藏态，
+        Selenium 的 `el.text` 会返回空字符串，因此必须用 JS 读取 `textContent` 与 `data-speed` 并触发点击。
+        """
         if target_speed == "1.0":
             return
 
-        # 兼容界面上可能显示的 "2.0X" / "2X" / "2.0x" / "1.5X" 等写法
         numeric = float(target_speed)
-        accepted_labels = {
+        accepted_labels = [
             f"{numeric:.1f}x",
             f"{numeric:g}x",
+            f"{numeric:.2f}x",
             f"{numeric:.1f}倍",
             f"{numeric:g}倍",
-        }
+            f"{numeric:.1f}",
+            f"{numeric:g}",
+        ]
 
-        # 1. 先尝试点击原生倍速菜单按钮展开列表
-        for btn_sel in SELECTORS.video_speed_button_selectors:
-            try:
-                btns = driver.find_elements(By.CSS_SELECTOR, btn_sel)
-                for btn in btns:
-                    if btn.is_displayed():
-                        driver.execute_script("arguments[0].click();", btn)
-                        time.sleep(0.4)
-                        break
-            except WebDriverException:
-                continue
+        try:
+            switched = driver.execute_script(
+                r"""
+                const labels = new Set(arguments[0]);
+                const targetNum = Number(arguments[1]);
 
-        # 2. 点击对应的原生倍速选项
-        for opt_sel in SELECTORS.video_speed_option_selectors:
-            try:
-                options = driver.find_elements(By.CSS_SELECTOR, opt_sel)
-                for opt in options:
-                    text = (opt.text or "").strip().lower().replace(" ", "")
-                    if text in accepted_labels:
-                        driver.execute_script("arguments[0].click();", opt)
-                        self.logger.info("【视频】已通过原生播放器切换至 %sx 倍速。", target_speed)
-                        return
-            except WebDriverException:
-                continue
+                // 模拟移入播放器与倍速按钮，激活雨课堂倍速弹层
+                const player = document.querySelector('.xt_video_player, xt-wrap, #video-box, video');
+                if (player) player.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+                const speedBtn = document.querySelector('xt-speedbutton, .xt_video_player_speed, [class*="speed"]');
+                if (speedBtn) {
+                  speedBtn.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+                  speedBtn.click();
+                }
 
-        # 3. 若播放器未暴露倍速 UI，则在合法上限（<= 2.0）内设置 playbackRate
+                const items = Array.from(
+                  document.querySelectorAll(
+                    'xt-speedlist li, .xt_video_player_common_list li, [class*="speed"] li, [data-speed]'
+                  )
+                );
+                for (const li of items) {
+                  const dataSpd = Number(li.getAttribute('data-speed') || (li.dataset && li.dataset.speed) || NaN);
+                  const rawTxt = (li.textContent || '').replace(/\s+/g, '').toLowerCase();
+                  if ((!Number.isNaN(dataSpd) && Math.abs(dataSpd - targetNum) < 0.05) || labels.has(rawTxt)) {
+                    li.click();
+                    return 'native';
+                  }
+                }
+                return items.length > 0 ? 'not_in_menu' : 'locked_or_hidden';
+                """,
+                accepted_labels,
+                numeric,
+            )
+            if switched == "native":
+                self.logger.info("【视频】已通过原生播放器菜单切换至 %sx 倍速。", target_speed)
+                return
+        except WebDriverException:
+            pass
+
+        # 若课程由教师关闭了倍速菜单（雨课堂部分思政课强制防倍速），日志如实提示
         safe_rate = min(2.0, max(1.0, numeric))
         try:
             driver.execute_script(
                 "const v = document.querySelector('video'); if (v) v.playbackRate = arguments[0];",
                 safe_rate,
             )
-            self.logger.info("【视频】未找到原生倍速菜单，已安全设置播放速率为 %.1fx。", safe_rate)
+            self.logger.info("【视频】该课程未开放倍速菜单（若被课程强制锁回 1.0x 属正常防作弊策略，将按 1.0x 稳健计分）。")
         except WebDriverException:
             self.logger.warning("【视频】倍速设置未生效，将保持默认 1.0x 播放。")
 
