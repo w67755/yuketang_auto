@@ -1,13 +1,17 @@
 """雨课堂课件 / PPT 自动观看与漏页定向补看模块。
 
-核心场景（对应雨课堂“同学你没有好好观看喔 / 您还有以下页面未看”校验机制）：
-1. 每页课件需停留足够时长，雨课堂才会记录该页为“已看”。
-2. 本模块执行流程：
-   - 第一轮（全量逐页浏览）：从第 1 页翻到最后一页，每页按配置的随机区间
-     `[ppt_dwell_min, ppt_dwell_max]` 停留，期间发送轻量页面交互并实时响应停止信号；
-   - 翻完后自动检查结束页是否出现“您还有以下页面未看”提示或侧边栏仍存在未读标记；
-   - 若存在未看页码，点击「继续观看」（如有），然后按页码逐一跳转并**加长停留时间**
-     进行定向补看，最多循环 `ppt_retry_rounds` 轮（默认 2 轮）。
+针对雨课堂网页版课件页（如 `/v2/web/studentCards/...`）的关键机制做了专门适配：
+1. 左侧缩略图栏采用**虚拟滚动（Virtual Scroll）**：DOM 中任意时刻只渲染约 10~12 个可见页，
+   因此绝不能按 DOM 数组下标 `slides[i]` 盲点（否则滚动后节点复用会导致跳页、漏页和提前结束）。
+2. 正确做法——按真实页码 `1 -> total_pages` 顺序驱动：
+   - 优先从顶栏「学习进度：done/total」（如 `10/25`、`0/75`）读取真实总页数；
+   - 严格按页码 `1, 2, 3, ..., total_pages` 依次在左侧虚拟列表中定向滚动查找对应页码缩略图；
+   - 若该页缩略图已带「已完成」标记，直接跳过节省时间；
+   - 否则点击该页并按配置的随机区间 `[ppt_dwell_min, ppt_dwell_max]` 停留；
+3. 精准完成校验与漏页定向补看：
+   - 翻完后同时检查顶栏「学习进度：done/total」是否达到 `done >= total`，以及是否出现
+     「您还有以下页面未看」提示；
+   - 若仍有未完成页，自动延长停留时长定向补看未完成页（最多 `ppt_retry_rounds` 轮）。
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ from __future__ import annotations
 import random
 import re
 import time
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.common.action_chains import ActionChains
@@ -27,6 +31,131 @@ from selenium.webdriver.remote.webelement import WebElement
 from core.browser import interruptible_sleep
 from core.selectors import SELECTORS
 from tasks.base import BaseTask, TaskKind, TaskResult, TaskStatus
+
+# 在左侧虚拟滚动缩略图栏中按精确页码查找并定向滚动的 JS
+# 返回结构：{ found, completed, active, element, minPage, maxPage, moved, hasSidebar }
+LOCATE_VIRTUAL_SLIDE_JS = r"""
+const targetPage = Number(arguments[0]);
+const doScroll = Boolean(arguments[1]);
+
+// 1. 定位左侧缩略图区域内的可滚动容器（位于视口左侧 40% 以内，且可竖向滚动）
+function findLeftScrollContainer() {
+  const all = Array.from(document.querySelectorAll('div, ul, section, aside'));
+  let best = null;
+  let bestScore = -1;
+  for (const el of all) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 80 || rect.width > window.innerWidth * 0.42) continue;
+    if (rect.height < 200 || rect.left > window.innerWidth * 0.30) continue;
+    if (el.scrollHeight <= el.clientHeight + 10) continue;
+    const style = window.getComputedStyle(el);
+    if (!['auto', 'scroll', 'overlay'].includes(style.overflowY)) continue;
+    const imgCount = el.querySelectorAll('img, canvas').length;
+    const score = imgCount * 100 + rect.height;
+    if (score > bestScore) {
+      bestScore = score;
+      best = el;
+    }
+  }
+  return best;
+}
+
+// 2. 在容器内提取每个缩略图卡片对应的真实页码（1-based）、完成态与激活态
+function collectThumbItems(scope) {
+  const root = scope || document;
+  const raw = Array.from(
+    root.querySelectorAll(
+      '[class*="slide"], [class*="thumb"], [class*="ppt-item"], [class*="page-item"], [class*="card-item"], li, .swiper-slide'
+    )
+  );
+  const byPage = new Map();
+  for (const el of raw) {
+    const rect = el.getBoundingClientRect();
+    // 缩略图项位于页面左侧栏，高度合理，避免选到整个大容器或单行文字
+    if (rect.left > window.innerWidth * 0.35) continue;
+    if (rect.width < 60 || rect.width > window.innerWidth * 0.38) continue;
+    if (rect.height < 40 || rect.height > 240) continue;
+
+    // 必须包含缩略图图片或画布，过滤掉“全部 / 未完成”等导航标签
+    if (!el.querySelector('img, canvas')) continue;
+
+    // 跳过包裹多个缩略图的父容器
+    const childImgs = el.querySelectorAll('img, canvas').length;
+    if (childImgs > 3) continue;
+
+    const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
+    const numMatch = text.match(/\b(\d{1,4})\b/);
+    if (!numMatch) continue;
+    const pageNo = Number(numMatch[1]);
+    if (pageNo < 1 || pageNo > 2000) continue;
+
+    const cls = (el.className || '').toString().toLowerCase();
+    const completed = text.includes('已完成') || cls.includes('finish') || cls.includes('complete');
+    const active = cls.includes('active') || cls.includes('selected') || cls.includes('current');
+
+    // 同一页码优先保留面积更紧凑的内层卡片元素
+    const prev = byPage.get(pageNo);
+    const area = rect.width * rect.height;
+    if (!prev || area < prev.area) {
+      byPage.set(pageNo, { pageNo, element: el, completed, active, area });
+    }
+  }
+  return Array.from(byPage.values()).sort((a, b) => a.pageNo - b.pageNo);
+}
+
+const container = findLeftScrollContainer();
+const items = collectThumbItems(container);
+const hasSidebar = Boolean(container) || items.length >= 2;
+
+if (!items.length) {
+  return { found: false, hasSidebar, minPage: null, maxPage: null, moved: false };
+}
+
+const minPage = items[0].pageNo;
+const maxPage = items[items.length - 1].pageNo;
+const hit = items.find((it) => it.pageNo === targetPage);
+
+if (hit) {
+  return {
+    found: true,
+    hasSidebar,
+    pageNo: hit.pageNo,
+    completed: hit.completed,
+    active: hit.active,
+    element: hit.element,
+    minPage,
+    maxPage,
+    moved: false,
+  };
+}
+
+let moved = false;
+if (doScroll && container) {
+  const before = container.scrollTop;
+  const step = Math.max(180, Math.floor(container.clientHeight * 0.55));
+  if (targetPage > maxPage) {
+    container.scrollTop = Math.min(container.scrollHeight, before + step);
+  } else if (targetPage < minPage) {
+    container.scrollTop = Math.max(0, before - step);
+  }
+  moved = Math.abs(container.scrollTop - before) > 2;
+}
+
+return { found: false, hasSidebar, minPage, maxPage, moved };
+"""
+
+
+def parse_study_progress(text: str) -> Optional[Tuple[int, int]]:
+    """从雨课堂顶栏文本（如 '学习进度：10/25'、'学习进度: 0/75'）解析 (已看页数, 总页数)。"""
+    if not text:
+        return None
+    match = re.search(r"学习进度[:：\s]*(\d{1,4})\s*/\s*(\d{1,4})", text)
+    if not match:
+        return None
+    done, total = int(match.group(1)), int(match.group(2))
+    if total <= 0 or done < 0 or done > total:
+        return None
+    return done, total
 
 
 def parse_page_counter(text: str) -> Optional[Tuple[int, int]]:
@@ -43,16 +172,9 @@ def parse_page_counter(text: str) -> Optional[Tuple[int, int]]:
 
 
 def parse_unviewed_pages(page_text: str, badge_texts: Iterable[str] = ()) -> List[int]:
-    """从结束页提示文本或未看标签列表中提取去重且升序排列的未看页码。
-
-    示例输入：
-    - page_text: "同学你没有好好观看喔 您还有以下页面未看 18 52 54 57 64 65 继续观看"
-    - badge_texts: ["18", "52", "54", "57", "64", "65"]
-    返回：[18, 52, 54, 57, 64, 65]
-    """
+    """从结束页提示文本或未看标签列表中提取去重且升序排列的未看页码。"""
     pages: set[int] = set()
 
-    # 1. 优先解析显式未看页码标签元素（最准确）
     for raw in badge_texts:
         cleaned = (raw or "").strip()
         if re.fullmatch(r"\d{1,4}", cleaned):
@@ -60,7 +182,6 @@ def parse_unviewed_pages(page_text: str, badge_texts: Iterable[str] = ()) -> Lis
             if 1 <= num <= 2000:
                 pages.add(num)
 
-    # 2. 再从“以下页面未看 / 未观看页面 / 未看页”之后的文本段落提取页码
     if page_text:
         pattern = re.search(
             r"(?:以下页面未看|未观看页面|未看页面|未读页面)[:：\s]*([\d\s,，、]+)",
@@ -76,11 +197,15 @@ def parse_unviewed_pages(page_text: str, badge_texts: Iterable[str] = ()) -> Lis
 
 
 class PptWatcher(BaseTask):
-    """负责单份课件/PPT 的逐页随机停留与未看页码自动补看。"""
+    """负责单份课件/PPT 的按页码顺序停留与未看页自动补看。"""
 
     def execute(self, title: str) -> TaskResult:
         driver = self.browser.ensure_started()
         self.browser.inject_anti_blur_now()
+        # 给 SPA 课件页留 1.5 秒加载顶栏与左侧虚拟缩略图列表
+        if not interruptible_sleep(1.5, self.stop_event):
+            return TaskResult(title, TaskKind.PPT, TaskStatus.STOPPED, "用户手动停止")
+
         self.logger.info(
             "【课件】开始观看：%s（每页随机停留 %.1f~%.1f 秒，最多补看 %d 轮）",
             title,
@@ -89,71 +214,197 @@ class PptWatcher(BaseTask):
             self.config.ppt_retry_rounds,
         )
 
-        # 如果进入时正好停留在“您还有以下页面未看”结果页，先直接尝试补看
+        # 1. 若顶栏已显示学习进度达成 100%（例如 25/25），直接跳过
+        progress = self._read_study_progress(driver)
+        if progress is not None:
+            done, total = progress
+            self.logger.info("【课件】当前顶栏学习进度：%d/%d", done, total)
+            if done >= total:
+                self.logger.info("【课件】《%s》进度已满（%d/%d），无需重复观看。", title, done, total)
+                return TaskResult(title, TaskKind.PPT, TaskStatus.SKIPPED, f"学习进度已满 {done}/{total}")
+
+        # 2. 若进入时停在“您还有以下页面未看”结果页，先直接触发定向补看
         initial_missed = self._detect_unviewed_pages(driver)
         if initial_missed:
             self.logger.info("【课件】进入页面即检测到 %d 个未看页码：%s，直接启动定向补看。", len(initial_missed), initial_missed)
             return self._run_remediation_loop(driver, title, initial_missed)
 
-        # 第一轮：全量逐页观看
-        slide_elements = self._find_slide_items(driver)
-        counter = self._read_page_counter(driver)
+        # 3. 优先走「按真实页码顺序驱动虚拟滚动缩略图栏」（彻底杜绝虚拟列表跳页/漏页）
+        total_pages = self._resolve_total_pages(driver, title, progress)
+        probe = self._locate_virtual_slide(driver, target_page=1, do_scroll=False)
 
-        if slide_elements:
-            ok = self._walk_by_slide_list(driver, title, slide_elements)
-        elif counter is not None:
-            ok = self._walk_by_next_action(driver, title, total_pages=counter[1], start_page=counter[0])
+        if total_pages is not None and probe.get("hasSidebar"):
+            ok = self._walk_virtual_sidebar_by_page_number(driver, title, total_pages, extra_dwell=0.0)
+        elif total_pages is not None:
+            counter = self._read_page_counter(driver)
+            start_p = counter[0] if counter else 1
+            ok = self._walk_by_next_action(driver, title, total_pages=total_pages, start_page=start_p)
         else:
-            # 兜底：适用于竖向长图/PDF 滚动式课件
             ok = self._walk_by_vertical_scroll(driver, title)
 
         if not ok:
             return TaskResult(title, TaskKind.PPT, TaskStatus.STOPPED, "用户手动停止")
 
-        # 翻完后稍等 2 秒让页面结算“是否全部观看”
-        if not interruptible_sleep(2.0, self.stop_event):
+        if not interruptible_sleep(1.5, self.stop_event):
             return TaskResult(title, TaskKind.PPT, TaskStatus.STOPPED, "用户手动停止")
 
+        # 4. 校验完成情况：同时核对“您还有以下页面未看”提示与顶栏“学习进度：done/total”
         missed_pages = self._detect_unviewed_pages(driver)
-        if not missed_pages:
-            self.logger.info("【课件】《%s》所有页面已观看完成，无漏看页码。", title)
-            return TaskResult(title, TaskKind.PPT, TaskStatus.COMPLETED, "课件全量观看完成")
+        if missed_pages:
+            return self._run_remediation_loop(driver, title, missed_pages)
 
-        return self._run_remediation_loop(driver, title, missed_pages)
+        after_progress = self._read_study_progress(driver)
+        if after_progress is not None:
+            done, total = after_progress
+            if done >= total:
+                self.logger.info("【课件】《%s》学习进度已达 %d/%d，全部观看完成！", title, done, total)
+                return TaskResult(title, TaskKind.PPT, TaskStatus.COMPLETED, f"学习进度已达 {done}/{total}")
 
-    def _walk_by_slide_list(
+            # 若仍有未完成页面，通过加长停留的补看轮次仅重看未标记「已完成」的页码
+            return self._run_virtual_remediation_loop(driver, title, total)
+
+        self.logger.info("【课件】《%s》全部页面已浏览完毕。", title)
+        return TaskResult(title, TaskKind.PPT, TaskStatus.COMPLETED, "课件全量观看完成")
+
+    # ------------------------------------------------------------------
+    # 核心：按页码 1..total 顺序遍历虚拟滚动缩略图（绝不跳页）
+    # ------------------------------------------------------------------
+    def _walk_virtual_sidebar_by_page_number(
         self,
         driver: WebDriver,
         title: str,
-        initial_slides: List[WebElement],
+        total_pages: int,
+        extra_dwell: float = 0.0,
     ) -> bool:
-        """通过左侧/底部缩略图列表逐页点击并随机停留。"""
-        total = len(initial_slides)
-        self.logger.info("【课件】检测到缩略图列表，共 %d 页，开始逐页停留...", total)
+        """按真实页码 1 -> total_pages 逐页定位左侧虚拟列表并停留。"""
+        self.logger.info("【课件】启用精确页码顺序模式，共 %d 页（跳过已标「已完成」页）...", total_pages)
+        skipped_done = 0
 
-        for idx in range(total):
+        for page_no in range(1, total_pages + 1):
             if self.stop_event.is_set():
                 return False
 
-            # 每页重新定位元素，防止 SPA 局部重渲染导致 StaleElementReferenceException
-            slides = self._find_slide_items(driver)
-            if idx >= len(slides):
-                break
-            slide = slides[idx]
+            info = self._scroll_until_page_found(driver, page_no)
+            if not info.get("found"):
+                # 若个别页在虚拟列表中未定位到，用方向键步进兜底并停留
+                self.logger.warning("【课件】未在左侧栏定位到第 %d/%d 页，使用翻页键步进...", page_no, total_pages)
+                self._step_next_page(driver)
+                dwell = self._pick_dwell_seconds(extra=extra_dwell)
+                if not self._dwell_with_keepalive(driver, dwell):
+                    return False
+                continue
 
+            if info.get("completed"):
+                skipped_done += 1
+                continue
+
+            # 点击精确页码对应的缩略图（不调用 scrollIntoView 避免打乱虚拟列表位置）
+            el = info.get("element")
             try:
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", slide)
-                driver.execute_script("arguments[0].click();", slide)
+                driver.execute_script("arguments[0].click();", el)
             except WebDriverException:
                 self._step_next_page(driver)
 
-            dwell = self._pick_dwell_seconds(extra=0.0)
-            self.logger.info("【课件】《%s》第 %d/%d 页，停留 %.1f 秒...", title, idx + 1, total, dwell)
+            dwell = self._pick_dwell_seconds(extra=extra_dwell)
+            self.logger.info("【课件】《%s》第 %d/%d 页，停留 %.1f 秒...", title, page_no, total_pages, dwell)
             if not self._dwell_with_keepalive(driver, dwell):
                 return False
 
+        if skipped_done > 0:
+            self.logger.info("【课件】本轮已自动跳过 %d 个已完成的页面。", skipped_done)
         return True
 
+    def _run_virtual_remediation_loop(self, driver: WebDriver, title: str, total_pages: int) -> TaskResult:
+        """当顶栏显示 done < total 时，按轮次加长停留时间只补看仍未带「已完成」标记的页面。"""
+        max_rounds = self.config.ppt_retry_rounds
+        for round_idx in range(1, max_rounds + 1):
+            if self.stop_event.is_set():
+                return TaskResult(title, TaskKind.PPT, TaskStatus.STOPPED, "用户手动停止")
+
+            progress = self._read_study_progress(driver)
+            if progress and progress[0] >= progress[1]:
+                return TaskResult(title, TaskKind.PPT, TaskStatus.COMPLETED, f"学习进度已达 {progress[0]}/{progress[1]}")
+
+            extra_sec = self.config.ppt_retry_extra_seconds * round_idx
+            self.logger.warning(
+                "【课件】《%s》当前进度 %s，启动第 %d/%d 轮未完成页补看（每页额外 +%.1f 秒）...",
+                title,
+                f"{progress[0]}/{progress[1]}" if progress else "未满",
+                round_idx,
+                max_rounds,
+                extra_sec,
+            )
+            ok = self._walk_virtual_sidebar_by_page_number(driver, title, total_pages, extra_dwell=extra_sec)
+            if not ok:
+                return TaskResult(title, TaskKind.PPT, TaskStatus.STOPPED, "用户手动停止")
+
+            interruptible_sleep(1.5, self.stop_event)
+            after = self._read_study_progress(driver)
+            if after and after[0] >= after[1]:
+                self.logger.info("【课件】《%s》第 %d 轮补看后进度已满（%d/%d）！", title, round_idx, after[0], after[1])
+                return TaskResult(title, TaskKind.PPT, TaskStatus.COMPLETED, f"补看后进度已达 {after[0]}/{after[1]}")
+
+        final_prog = self._read_study_progress(driver)
+        prog_str = f"{final_prog[0]}/{final_prog[1]}" if final_prog else "未知"
+        msg = f"经过 {max_rounds} 轮补看后学习进度仍为 {prog_str}"
+        self.logger.error("【课件】《%s》%s", title, msg)
+        return TaskResult(title, TaskKind.PPT, TaskStatus.FAILED, msg)
+
+    def _scroll_until_page_found(self, driver: WebDriver, target_page: int, max_scrolls: int = 35) -> Dict[str, Any]:
+        """在左侧虚拟滚动栏中按方向逐步滚动，直到精确页码进入 DOM。"""
+        for _ in range(max_scrolls):
+            if self.stop_event.is_set():
+                return {"found": False}
+            info = self._locate_virtual_slide(driver, target_page=target_page, do_scroll=True)
+            if info.get("found"):
+                return info
+            if not info.get("moved"):
+                # 已经滚到顶部或底部仍未找到，再重试一次确认渲染
+                time.sleep(0.25)
+                return self._locate_virtual_slide(driver, target_page=target_page, do_scroll=False)
+            time.sleep(0.18)
+        return {"found": False}
+
+    def _locate_virtual_slide(self, driver: WebDriver, target_page: int, do_scroll: bool) -> Dict[str, Any]:
+        try:
+            res = driver.execute_script(LOCATE_VIRTUAL_SLIDE_JS, target_page, do_scroll)
+            return res if isinstance(res, dict) else {"found": False}
+        except WebDriverException:
+            return {"found": False}
+
+    def _resolve_total_pages(
+        self,
+        driver: WebDriver,
+        title: str,
+        progress: Optional[Tuple[int, int]],
+    ) -> Optional[int]:
+        """综合顶栏学习进度、任务标题中的 X/Y 以及页码计数器确定真实总页数。"""
+        if progress is not None:
+            return progress[1]
+
+        counter = self._read_page_counter(driver)
+        if counter is not None:
+            return counter[1]
+
+        # 从任务标题兜底提取（例如 “第五讲 ... 0/75 学习进度”）
+        match = re.search(r"\d{1,4}\s*/\s*(\d{1,4})", title or "")
+        if match:
+            total = int(match.group(1))
+            if total > 0:
+                return total
+        return None
+
+    def _read_study_progress(self, driver: WebDriver) -> Optional[Tuple[int, int]]:
+        """读取顶栏「学习进度：X/Y」。"""
+        try:
+            text = driver.execute_script("return document.body ? document.body.innerText.slice(0, 600) : '';") or ""
+            return parse_study_progress(text)
+        except WebDriverException:
+            return None
+
+    # ------------------------------------------------------------------
+    # 兼容其他雨课堂版本：翻页按钮步进 / 竖向滚动 / 结束页未看提示补看
+    # ------------------------------------------------------------------
     def _walk_by_next_action(
         self,
         driver: WebDriver,
@@ -175,7 +426,6 @@ class PptWatcher(BaseTask):
                 return False
 
             if current_page >= total_pages:
-                # 在最后一页额外翻一次，触发部分雨课堂版本的完成结算页
                 self._step_next_page(driver)
                 break
 
@@ -219,7 +469,7 @@ class PptWatcher(BaseTask):
         title: str,
         initial_missed: List[int],
     ) -> TaskResult:
-        """针对“您还有以下页面未看”进行加长停留的定向补看循环（最多重试 N 轮）。"""
+        """针对“您还有以下页面未看”结果页进行加长停留的定向补看循环（最多重试 N 轮）。"""
         missed_pages = initial_missed
         max_rounds = self.config.ppt_retry_rounds
 
@@ -237,7 +487,6 @@ class PptWatcher(BaseTask):
                 extra_sec,
             )
 
-            # 若当前停在“同学你没有好好观看喔”结果页，先点击「继续观看」回到课件视图
             self._click_continue_watching_if_present(driver)
             interruptible_sleep(1.0, self.stop_event)
 
@@ -256,8 +505,7 @@ class PptWatcher(BaseTask):
                 if not self._dwell_with_keepalive(driver, dwell):
                     return TaskResult(title, TaskKind.PPT, TaskStatus.STOPPED, "用户手动停止")
 
-            # 补看完毕后翻至末页触发状态刷新，再次检测是否仍有未看页
-            self._trigger_completion_check(driver)
+            self._step_next_page(driver)
             if not interruptible_sleep(2.0, self.stop_event):
                 return TaskResult(title, TaskKind.PPT, TaskStatus.STOPPED, "用户手动停止")
 
@@ -271,24 +519,13 @@ class PptWatcher(BaseTask):
         return TaskResult(title, TaskKind.PPT, TaskStatus.FAILED, msg)
 
     def _detect_unviewed_pages(self, driver: WebDriver) -> List[int]:
-        """综合页面提示语、未看页码标签与侧边栏未读标记，返回未看页码列表。"""
+        """检测页面是否存在“您还有以下页面未看”提示与未看页码标签。"""
         badge_texts: List[str] = []
         for selector in SELECTORS.ppt_unviewed_badge_selectors:
             try:
                 for el in driver.find_elements(By.CSS_SELECTOR, selector):
                     if el.is_displayed():
                         badge_texts.append(el.text or "")
-            except WebDriverException:
-                continue
-
-        # 额外检查侧边栏中带有明确“未看/unread”类名的缩略图项
-        slides = self._find_slide_items(driver)
-        for idx, slide in enumerate(slides, start=1):
-            try:
-                cls = (slide.get_attribute("class") or "").lower()
-                text = (slide.text or "").strip()
-                if any(flag in cls for flag in ("unread", "unviewed", "not-read")) or "未看" in text:
-                    badge_texts.append(str(idx))
             except WebDriverException:
                 continue
 
@@ -300,7 +537,6 @@ class PptWatcher(BaseTask):
         return parse_unviewed_pages(body_text, badge_texts)
 
     def _click_continue_watching_if_present(self, driver: WebDriver) -> bool:
-        """若页面存在“继续观看”按钮，点击返回课件展示区。"""
         for label in SELECTORS.ppt_continue_button_texts:
             try:
                 xpath = f"//*[self::button or self::a or self::div or self::span][normalize-space()='{label}']"
@@ -313,73 +549,28 @@ class PptWatcher(BaseTask):
         return False
 
     def _jump_to_page(self, driver: WebDriver, page_no: int) -> bool:
-        """精准跳转到指定页码（1-based）：优先点缩略图，其次点未看页码按钮，最后按方向键步进。"""
-        # 方式 1：点击结束页或页码条中直接标有该数字的按钮
-        try:
-            xpath = f"//*[self::button or self::span or self::div or self::li][normalize-space()='{page_no}']"
-            for el in driver.find_elements(By.XPATH, xpath):
-                if el.is_displayed():
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                    driver.execute_script("arguments[0].click();", el)
-                    time.sleep(0.35)
-                    return True
-        except WebDriverException:
-            pass
-
-        # 方式 2：按索引点击缩略图列表第 page_no - 1 项
-        slides = self._find_slide_items(driver)
-        if 1 <= page_no <= len(slides):
+        """精准跳转到指定页码（优先通过虚拟侧边栏精确定位）。"""
+        info = self._scroll_until_page_found(driver, page_no)
+        if info.get("found") and info.get("element") is not None:
             try:
-                target = slides[page_no - 1]
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
-                driver.execute_script("arguments[0].click();", target)
-                time.sleep(0.35)
+                driver.execute_script("arguments[0].click();", info["element"])
+                time.sleep(0.3)
                 return True
             except WebDriverException:
                 pass
 
-        # 方式 3：基于当前页码计数用上一页/下一页步进逼近
-        counter = self._read_page_counter(driver)
-        if counter is not None:
-            current, _ = counter
-            diff = page_no - current
-            steps = min(abs(diff), 80)
-            for _ in range(steps):
-                if self.stop_event.is_set():
-                    return False
-                if diff > 0:
-                    self._step_next_page(driver)
-                else:
-                    self._step_prev_page(driver)
-                time.sleep(0.2)
-            return True
+        try:
+            xpath = f"//*[self::button or self::span or self::div or self::li][normalize-space()='{page_no}']"
+            for el in driver.find_elements(By.XPATH, xpath):
+                if el.is_displayed():
+                    driver.execute_script("arguments[0].click();", el)
+                    time.sleep(0.3)
+                    return True
+        except WebDriverException:
+            pass
         return False
 
-    def _trigger_completion_check(self, driver: WebDriver) -> None:
-        """补看完毕后跳到最后一页并尝试再翻一次，促使页面刷新完成统计。"""
-        slides = self._find_slide_items(driver)
-        if slides:
-            try:
-                driver.execute_script("arguments[0].click();", slides[-1])
-                time.sleep(0.5)
-            except WebDriverException:
-                pass
-        self._step_next_page(driver)
-
-    def _find_slide_items(self, driver: WebDriver) -> List[WebElement]:
-        """查找可见的课件页缩略图/页码节点列表。"""
-        for selector in SELECTORS.ppt_slide_item_selectors:
-            try:
-                items = [el for el in driver.find_elements(By.CSS_SELECTOR, selector) if el.is_displayed()]
-                # 至少 2 个节点才认为是有效的多页列表，避免误命中单个容器
-                if len(items) >= 2:
-                    return items
-            except WebDriverException:
-                continue
-        return []
-
     def _read_page_counter(self, driver: WebDriver) -> Optional[Tuple[int, int]]:
-        """读取页面上类似 '18 / 70' 的当前页与总页数。"""
         for selector in SELECTORS.ppt_counter_selectors:
             try:
                 for el in driver.find_elements(By.CSS_SELECTOR, selector):
@@ -392,7 +583,6 @@ class PptWatcher(BaseTask):
         return None
 
     def _step_next_page(self, driver: WebDriver) -> None:
-        """翻到下一页：优先点击下一页按钮，否则发送键盘右方向键。"""
         for selector in SELECTORS.ppt_next_button_selectors:
             try:
                 for btn in driver.find_elements(By.CSS_SELECTOR, selector):
@@ -402,32 +592,15 @@ class PptWatcher(BaseTask):
             except WebDriverException:
                 continue
         try:
-            ActionChains(driver).send_keys(Keys.ARROW_RIGHT).perform()
-        except WebDriverException:
-            pass
-
-    def _step_prev_page(self, driver: WebDriver) -> None:
-        """翻到上一页：优先点击上一页按钮，否则发送键盘左方向键。"""
-        for selector in SELECTORS.ppt_prev_button_selectors:
-            try:
-                for btn in driver.find_elements(By.CSS_SELECTOR, selector):
-                    if btn.is_displayed():
-                        driver.execute_script("arguments[0].click();", btn)
-                        return
-            except WebDriverException:
-                continue
-        try:
-            ActionChains(driver).send_keys(Keys.ARROW_LEFT).perform()
+            ActionChains(driver).send_keys(Keys.ARROW_DOWN).perform()
         except WebDriverException:
             pass
 
     def _pick_dwell_seconds(self, extra: float = 0.0) -> float:
-        """按配置区间生成拟人化随机停留时长。"""
         base = random.uniform(self.config.ppt_dwell_min, self.config.ppt_dwell_max)
         return round(base + max(0.0, extra), 1)
 
     def _dwell_with_keepalive(self, driver: WebDriver, seconds: float) -> bool:
-        """在当前课件页停留指定时长，期间执行轻量活跃触发防止页面休眠。"""
         half = seconds / 2.0
         if not interruptible_sleep(half, self.stop_event):
             return False

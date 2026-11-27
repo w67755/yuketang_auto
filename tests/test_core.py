@@ -16,7 +16,7 @@ from core.scheduler import (
 from tasks.auto_quiz import detect_question_type, match_option_indices
 from tasks.base import TaskKind
 from tasks.deepseek_client import build_question_prompt, parse_answer_list
-from tasks.watch_ppt import parse_page_counter, parse_unviewed_pages
+from tasks.watch_ppt import parse_page_counter, parse_study_progress, parse_unviewed_pages
 
 
 class TestCoreLogic(unittest.TestCase):
@@ -53,6 +53,8 @@ class TestCoreLogic(unittest.TestCase):
         self.assertEqual(parse_page_counter("70 / 70"), (70, 70))
         self.assertEqual(parse_page_counter("第 12/65 页"), (12, 65))
         self.assertIsNone(parse_page_counter("已完成"))
+        self.assertEqual(parse_study_progress("第六讲大国外交 | 学习进度：10/25"), (10, 25))
+        self.assertEqual(parse_study_progress("学习进度: 75/75"), (75, 75))
 
     def test_deepseek_answer_parsing(self) -> None:
         self.assertEqual(parse_answer_list('["A", "C"]'), ["A", "C"])

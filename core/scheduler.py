@@ -338,7 +338,9 @@ class CourseScheduler:
                     continue
 
                 short_title = raw_text[:45]
-                task_key = f"{selector}#{idx}:{short_title}"
+                # 归一化任务指纹时去掉动态进度数字（如 0/25 -> 10/25），防止同一课件因进度微变被反复重入
+                stable_title = re.sub(r"\d+\s*/\s*\d+\s*学习进度", "", short_title).strip()
+                task_key = f"{selector}:{stable_title}"
                 if task_key in attempted_keys:
                     continue
 
