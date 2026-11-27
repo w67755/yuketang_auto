@@ -362,6 +362,13 @@ class CourseScheduler:
         attempted_keys: set[str],
     ) -> Optional[Tuple[str, str, TaskKind, object]]:
         """在当前列表 DOM 中收集未完成任务，并按 `task_order` 优先级返回最应先执行的一项。"""
+        # 0. 若当前在 /pro/lms/.../studycontent（学习内容章节总览页），走精准右侧内容总览扫描器
+        #    严格限定在 section.section-fr 内，绝不会误点左侧目录栏（#chapter-section）或顶部导航栏
+        if "/studycontent" in (driver.current_url or "").lower():
+            study_item = self._find_next_studycontent_task(driver, attempted_keys)
+            if study_item is not None:
+                return study_item
+
         candidates: List[Tuple[int, int, str, str, TaskKind, object]] = []
         seq = 0
 
@@ -411,7 +418,7 @@ class CourseScheduler:
                 _, _, task_key, short_title, guessed_kind, item = candidates[0]
                 return task_key, short_title, guessed_kind, item
 
-        # 2. 语义兜底：针对动态类名页面按最小包含块匹配并按优先级排序
+        # 2. 语义兜底：针对动态类名页面按最小包含块匹配并按优先级排序（严格排除导航栏与左侧目录）
         try:
             fallback_nodes = driver.execute_script(
                 """
@@ -420,6 +427,7 @@ class CourseScheduler:
                 const candidates = Array.from(document.querySelectorAll('div, li, section, article, a'));
                 const matched = [];
                 for (const el of candidates) {
+                  if (el.closest('#chapter-section, .section-fl, .rain-tabs__nav, .classroom-header-base')) continue;
                   const rect = el.getBoundingClientRect();
                   if (rect.width < 120 || rect.height < 28 || rect.height > 260) continue;
                   const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
@@ -460,6 +468,140 @@ class CourseScheduler:
             pass
 
         return None
+
+    def _find_next_studycontent_task(
+        self,
+        driver: WebDriver,
+        attempted_keys: set[str],
+    ) -> Optional[Tuple[str, str, TaskKind, object]]:
+        """精准扫描「学习内容（/pro/lms/.../studycontent）」右侧内容总览中的未完成任务行。
+
+        原理：
+        - 在 `section.section-fr` 内定位所有带蓝色未完成状态标签（`未开始`、`进行中(...)`、`已观看...`）的行；
+        - 结合每行的 SVG/图标类名与状态文本区分「视频 / 课件 / 习题」，并按 `task_order` 优先级返回首项。
+        """
+        try:
+            rows = driver.execute_script(
+                r"""
+                const root = document.querySelector('section.section-fr, .section-fr') || document.body;
+                const statusNodes = Array.from(root.querySelectorAll('[class*="blue-color"], .el-tooltip.item, span, div'))
+                  .filter((el) => {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0 || rect.height > 48) return false;
+                    const txt = (el.innerText || '').replace(/\s+/g, ' ').trim();
+                    if (!txt || txt.length > 24) return false;
+                    return txt === '未开始' || /^进行中/.test(txt) || /^已观看/.test(txt) || txt === '未完成' || txt === '未提交';
+                  });
+
+                const seen = new Set();
+                const results = [];
+                for (const badge of statusNodes) {
+                  // 向上查找对应的单条任务行容器（宽度 >= 300px，高度在 28~130px 之间）
+                  let row = badge.parentElement;
+                  let picked = null;
+                  while (row && row !== root && row !== document.body) {
+                    const r = row.getBoundingClientRect();
+                    const t = (row.innerText || '').replace(/\s+/g, ' ').trim();
+                    if (r.width >= 300 && r.height >= 28 && r.height <= 130 && t.length > (badge.innerText || '').trim().length + 2) {
+                      picked = row;
+                      // 继续向上看一层是否仍是同一行外框（避免只点到右侧状态栏）
+                      const parent = row.parentElement;
+                      if (parent && parent !== root) {
+                        const pr = parent.getBoundingClientRect();
+                        if (pr.height <= 130 && pr.width >= 300 && (parent.innerText || '').replace(/\s+/g, ' ').trim().length < 220) {
+                          picked = parent;
+                        }
+                      }
+                      break;
+                    }
+                    row = row.parentElement;
+                  }
+                  if (!picked || seen.has(picked)) continue;
+                  seen.add(picked);
+
+                  const rowText = (picked.innerText || '').replace(/\s+/g, ' ').trim();
+                  const statusText = (badge.innerText || '').replace(/\s+/g, ' ').trim();
+                  // 收集该行内图标的 SVG use/href 或 icon class，用于区分视频图标 vs P 课件图标 vs 习题图标
+                  const iconHints = [];
+                  for (const useEl of picked.querySelectorAll('use')) {
+                    iconHints.push(useEl.getAttribute('xlink:href') || useEl.getAttribute('href') || '');
+                  }
+                  for (const iconEl of picked.querySelectorAll('i, svg')) {
+                    const cls = typeof iconEl.className === 'string' ? iconEl.className : (iconEl.className && iconEl.className.baseVal) || '';
+                    if (cls) iconHints.push(cls);
+                  }
+                  // 优先把行内主标题区域作为可点击目标（点击标题最稳，不会误触提示 tooltip）
+                  const clickTarget = picked.querySelector('[class*="title"], [class*="name"], .leaf-detail, a') || picked;
+                  results.push({
+                    element: clickTarget,
+                    text: rowText,
+                    status: statusText,
+                    iconHint: iconHints.join(' ').toLowerCase(),
+                  });
+                }
+                return results;
+                """
+            ) or []
+        except WebDriverException:
+            return None
+
+        candidates: List[Tuple[int, int, str, str, TaskKind, object]] = []
+        for idx, row in enumerate(rows):
+            raw_text = (row.get("text") or "").strip()
+            status_text = (row.get("status") or "").strip()
+            icon_hint = (row.get("iconHint") or "").lower()
+            element = row.get("element")
+            if not raw_text or element is None:
+                continue
+            if any(done_kw in raw_text for done_kw in SELECTORS.completed_keywords):
+                continue
+            if is_progress_fraction_completed(raw_text):
+                continue
+
+            # 结合图标特征 + 状态文本精准判定该行是视频、课件还是习题
+            guessed_kind = self._classify_studycontent_row(raw_text, status_text, icon_hint)
+            if not self._is_kind_enabled(guessed_kind):
+                continue
+
+            # 去掉末尾状态词生成稳定任务指纹，避免进度从“未开始”变“进行中”后重复进入
+            clean_title = re.sub(r"请在\d{4}-\d{2}-\d{2}.*?完成学习", "", raw_text)
+            clean_title = clean_title.replace(status_text, "").strip()[:45]
+            task_key = f"studycontent:{guessed_kind.value}:{clean_title}"
+            if task_key in attempted_keys:
+                continue
+
+            rank = task_priority_rank(guessed_kind, self.config.task_order)
+            candidates.append((rank, idx, task_key, f"{clean_title} [{status_text}]", guessed_kind, element))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda c: (c[0], c[1]))
+        _, _, task_key, display_title, guessed_kind, element = candidates[0]
+        return task_key, display_title, guessed_kind, element
+
+    def _classify_studycontent_row(self, raw_text: str, status_text: str, icon_hint: str) -> TaskKind:
+        """结合雨课堂 studycontent 行内图标与状态文字识别任务类型。"""
+        # 1. 带分数进度（如 “进行中(70/75)”）明确是课件/PPT
+        if re.search(r"\(\s*\d+\s*/\s*\d+\s*\)", status_text):
+            return TaskKind.PPT
+        # 2. 图标类名/SVG 名称特征（雨课堂常用 icon-shipin / icon-tuwen / icon-kejian / icon-zuoye）
+        if any(k in icon_hint for k in ("shipin", "video", "play", "mooc")):
+            return TaskKind.VIDEO
+        if any(k in icon_hint for k in ("ppt", "kejian", "tuwen", "doc", "card", "slide")):
+            return TaskKind.PPT
+        if any(k in icon_hint for k in ("zuoye", "homework", "exam", "quiz", "paper", "xiti")):
+            return TaskKind.QUIZ
+        # 3. 文本关键词回退（如 “小论文” / “心得体会” 归为习题/作业类，不误当视频）
+        if any(k in raw_text for k in ("小论文", "心得", "作业", "习题", "测验", "考试")):
+            return TaskKind.QUIZ
+        guessed = classify_task_text(raw_text)
+        if guessed != TaskKind.UNKNOWN:
+            return guessed
+        # 4. 在“视频学习”章节下的“未开始”且无 X/Y 分数的普通讲次，默认判为视频
+        if status_text == "未开始" or status_text.startswith("已观看"):
+            return TaskKind.VIDEO
+        return TaskKind.UNKNOWN
 
     def _is_kind_enabled(self, kind: TaskKind) -> bool:
         """检查用户是否在配置中启用了对应类型的任务。"""

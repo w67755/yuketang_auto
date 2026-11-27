@@ -32,14 +32,14 @@ class VideoWatcher(BaseTask):
         self.browser.inject_anti_blur_now()
         self.logger.info("【视频】开始处理：%s（目标倍速：%sx）", title, self.config.video_speed)
 
-        # 1. 先检查页面上是否已经显示“已完成”
+        # 1. 先等待 <video> 元素加载（兼容主文档或嵌套 iframe），确认确实进入了视频播放页
+        if not self._locate_video_context(driver, wait_seconds=15):
+            return TaskResult(title, TaskKind.VIDEO, TaskStatus.FAILED, "未在页面中找到 <video> 播放器元素")
+
+        # 2. 确认进入视频页后，再检查页面顶部状态栏是否已经显示 100% 完成
         if self._is_page_marked_completed(driver):
             self.logger.info("【视频】《%s》已显示完成，跳过。", title)
             return TaskResult(title, TaskKind.VIDEO, TaskStatus.SKIPPED, "页面已标注已完成")
-
-        # 2. 等待 <video> 元素加载（兼容主文档或嵌套 iframe）
-        if not self._locate_video_context(driver, wait_seconds=15):
-            return TaskResult(title, TaskKind.VIDEO, TaskStatus.FAILED, "未在页面中找到 <video> 播放器元素")
 
         # 3. 静音并开启播放
         if self.config.video_mute:
