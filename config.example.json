@@ -1,0 +1,22 @@
+{
+  "base_url": "https://changjiang.yuketang.cn",
+  "browser": "edge",
+  "driver_path": "",
+  "profile_dir": "browser_profile",
+  "course_names": [],
+  "takeover_current_page": true,
+  "enable_video": true,
+  "enable_ppt": true,
+  "enable_quiz": true,
+  "video_speed": "2.0",
+  "video_mute": true,
+  "ppt_dwell_min": 5.0,
+  "ppt_dwell_max": 8.0,
+  "ppt_retry_rounds": 2,
+  "ppt_retry_extra_seconds": 3.0,
+  "deepseek_api_key": "",
+  "deepseek_model": "deepseek-chat",
+  "deepseek_base_url": "https://api.deepseek.com",
+  "auto_submit_quiz": true,
+  "save_diagnostics_on_error": true
+}

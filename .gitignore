@@ -1,0 +1,22 @@
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# 敏感配置与本地运行数据（切勿上传到 GitHub）
+config.json
+browser_profile/
+logs/
+
+# 打包产物与 IDE 配置
+build/
+dist/
+*.spec
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
