@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import random
 import re
 from typing import List
 
@@ -89,18 +90,20 @@ def parse_answer_list(raw_content: str) -> List[str]:
 
 
 class DeepSeekClient:
-    """封装 DeepSeek Chat Completions API 请求与错误诊断。"""
+    """封装 DeepSeek Chat Completions API 请求与多模型容错切换。"""
 
     def __init__(
         self,
         api_key: str,
-        model: str = "deepseek-chat",
+        model: str = "deepseek-v4-pro,deepseek-v4-flash",
         base_url: str = "https://api.deepseek.com",
         timeout: int = 45,
         logger: logging.Logger | None = None,
     ) -> None:
         self.api_key = (api_key or "").strip()
-        self.model = (model or "deepseek-chat").strip()
+        raw_models = (model or "deepseek-v4-pro,deepseek-v4-flash").replace("，", ",")
+        self.models = [m.strip() for m in raw_models.split(",") if m.strip()] or ["deepseek-v4-pro", "deepseek-v4-flash"]
+        self.model = self.models[0]
         self.endpoint = f"{(base_url or 'https://api.deepseek.com').rstrip('/')}/chat/completions"
         self.timeout = timeout
         self.logger = logger
@@ -110,7 +113,7 @@ class DeepSeekClient:
         return self.api_key.startswith("sk-") and len(self.api_key) >= 12
 
     def ask(self, question_type: str, question_text: str) -> List[str]:
-        """调用 DeepSeek API 获取题目答案列表；异常时抛出可读错误信息。"""
+        """调用 DeepSeek API 获取题目答案列表；配置多模型时随机选用并在失败时自动回退。"""
         if not self.is_configured():
             raise ValueError("DeepSeek API Key 未配置或格式无效（应以 sk- 开头）")
 
@@ -119,28 +122,42 @@ class DeepSeekClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,  # 答题场景采用低温度以提高准确率与格式稳定性
-            "stream": False,
-        }
 
-        resp = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout)
-        if resp.status_code == 401:
-            raise RuntimeError("DeepSeek API 鉴权失败（401），请检查 API Key 是否正确")
-        if resp.status_code == 402:
-            raise RuntimeError("DeepSeek 账户余额不足（402），请先在官网充值")
-        if resp.status_code >= 400:
-            raise RuntimeError(f"DeepSeek API 请求失败（HTTP {resp.status_code}）：{resp.text[:200]}")
+        # 若填写多个模型（如 deepseek-v4-pro,deepseek-v4-flash），随机排优先级并在单模型报错时自动回退
+        candidates = list(self.models)
+        random.shuffle(candidates)
+        last_error: Exception | None = None
 
-        data = resp.json()
-        choices = data.get("choices") or []
-        if not choices:
-            raise RuntimeError("DeepSeek API 未返回有效候选答案")
+        for model_name in candidates:
+            payload = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,  # 答题场景采用低温度以提高准确率与格式稳定性
+                "stream": False,
+            }
+            resp = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout)
+            if resp.status_code == 401:
+                raise RuntimeError("DeepSeek API 鉴权失败（401），请检查 API Key 是否正确")
+            if resp.status_code == 402:
+                raise RuntimeError("DeepSeek 账户余额不足（402），请先在官网充值")
+            if resp.status_code >= 400:
+                last_error = RuntimeError(
+                    f"模型 {model_name} 请求失败（HTTP {resp.status_code}）：{resp.text[:200]}"
+                )
+                if self.logger:
+                    self.logger.warning("【DeepSeek】%s，尝试切换备选模型...", last_error)
+                continue
 
-        content = (choices[0].get("message") or {}).get("content") or ""
-        answers = parse_answer_list(content)
-        if self.logger:
-            self.logger.info("【DeepSeek】解析答案：%s", answers)
-        return answers
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices:
+                last_error = RuntimeError(f"模型 {model_name} 未返回有效候选答案")
+                continue
+
+            content = (choices[0].get("message") or {}).get("content") or ""
+            answers = parse_answer_list(content)
+            if self.logger:
+                self.logger.info("【DeepSeek:%s】解析答案：%s", model_name, answers)
+            return answers
+
+        raise last_error or RuntimeError("DeepSeek API 调用失败")

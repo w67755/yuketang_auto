@@ -50,17 +50,17 @@ return (() => {
   }));
 
   const interactive = Array.from(
-    document.querySelectorAll('button, a, [role="button"], li, [class*="item"], [class*="page"], [class*="slide"]')
+    document.querySelectorAll('button, a, [role="button"], [role="tab"], li, section, article, [class*="card"], [class*="activity"], [class*="log"], [class*="unit"], [class*="item"], [class*="page"], [class*="slide"]')
   )
     .filter(visible)
-    .slice(0, 120)
     .map((el) => ({
       tag: el.tagName.toLowerCase(),
       id: el.id || '',
-      className: typeof el.className === 'string' ? el.className.slice(0, 120) : '',
+      className: typeof el.className === 'string' ? el.className.slice(0, 140) : '',
       text: clean(el.innerText || el.textContent),
     }))
-    .filter((item) => item.text || item.id || item.className);
+    .filter((item) => item.text.length > 0)
+    .slice(0, 120);
 
   const bodyText = clean(document.body ? document.body.innerText : '').slice(0, 1000);
 

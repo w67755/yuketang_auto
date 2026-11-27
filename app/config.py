@@ -26,6 +26,15 @@ SERVER_PRESETS = {
     "自定义网址": "",
 }
 
+# DeepSeek 常用模型预设（支持逗号分隔多模型自动切换与回退）
+DEEPSEEK_MODEL_PRESETS = (
+    "deepseek-v4-pro,deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    "deepseek-chat",
+    "deepseek-reasoner",
+)
+
 # 雨课堂原生支持的合法视频倍速集合（避免超高倍速导致进度不计分）
 ALLOWED_VIDEO_SPEEDS = ("1.0", "1.5", "2.0")
 ALLOWED_BROWSERS = ("edge", "chrome")
@@ -62,7 +71,7 @@ class AppConfig:
 
     # ---------- DeepSeek API 做题配置 ----------
     deepseek_api_key: str = ""
-    deepseek_model: str = "deepseek-chat"
+    deepseek_model: str = "deepseek-v4-pro,deepseek-v4-flash"
     deepseek_base_url: str = "https://api.deepseek.com"
     auto_submit_quiz: bool = True          # 全部题型答完后直接自动提交
 
@@ -93,7 +102,7 @@ class AppConfig:
         self.course_names = [name.strip() for name in self.course_names if name and name.strip()]
 
         self.deepseek_api_key = (self.deepseek_api_key or "").strip()
-        self.deepseek_model = (self.deepseek_model or "deepseek-chat").strip()
+        self.deepseek_model = (self.deepseek_model or "deepseek-v4-pro,deepseek-v4-flash").strip()
         self.deepseek_base_url = (self.deepseek_base_url or "https://api.deepseek.com").strip().rstrip("/")
         return self
 

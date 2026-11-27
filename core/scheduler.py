@@ -163,8 +163,9 @@ class CourseScheduler:
             summary.record(result)
             return
 
-        # 否则视为课程目录 / 学习日志列表页：展开章节并依次扫描未完成任务
+        # 否则视为课程目录 / 学习日志列表页：等待异步列表渲染完成，再展开章节并扫描
         self.logger.info("正在扫描《%s》中的未完成任务点...", course_label)
+        interruptible_sleep(2.5, self.stop_event)
         self._expand_collapsed_chapters(driver)
         interruptible_sleep(1.5, self.stop_event)
 
@@ -189,7 +190,21 @@ class CourseScheduler:
 
             next_candidate = self._find_next_pending_task(driver, attempted_keys)
             if next_candidate is None:
-                self.logger.info("《%s》所有符合条件的未完成任务点已处理完毕！", course_label)
+                # 若一轮都没识别到任何任务点，自动保存诊断快照方便排查页面 DOM 结构
+                if not attempted_keys:
+                    self.logger.warning(
+                        "在《%s》当前页面未识别到未完成任务点（可能全部已完成，或该页 DOM 选择器需适配）。",
+                        course_label,
+                    )
+                    if self.config.save_diagnostics_on_error:
+                        capture_diagnostics(
+                            driver,
+                            f"zero_tasks_{course_label}",
+                            "课程页面未识别到任何待处理任务点",
+                            self.logger,
+                        )
+                else:
+                    self.logger.info("《%s》所有符合条件的未完成任务点已处理完毕！", course_label)
                 break
 
             task_key, task_title, guessed_kind, element = next_candidate
@@ -251,7 +266,8 @@ class CourseScheduler:
         driver: WebDriver,
         attempted_keys: set[str],
     ) -> Optional[Tuple[str, str, TaskKind, object]]:
-        """在当前课程目录 DOM 中找到下一个尚未完成且未被尝试过的任务项。"""
+        """在当前课程目录 / 学习日志 DOM 中找到下一个尚未完成且未被尝试过的任务项。"""
+        # 1. 先按已知任务卡片选择器匹配
         for selector in SELECTORS.task_item_selectors:
             try:
                 items = driver.find_elements(By.CSS_SELECTOR, selector)
@@ -263,9 +279,13 @@ class CourseScheduler:
                     if not item.is_displayed():
                         continue
                     raw_text = " ".join((item.text or "").split())
-                    if not raw_text or len(raw_text) < 2:
+                    if not raw_text or len(raw_text) < 4 or len(raw_text) > 500:
                         continue
                 except StaleElementReferenceException:
+                    continue
+
+                # 过滤顶部导航栏/标签页等非任务卡片文本
+                if raw_text in SELECTORS.ignored_nav_texts:
                     continue
 
                 # 跳过明确标注“已完成 / 100% / 已提交”的条目
@@ -273,6 +293,13 @@ class CourseScheduler:
                     continue
 
                 guessed_kind = classify_task_text(raw_text)
+                # 对通用容器（如 .el-card / li）要求文本中包含明确的任务特征，避免误点普通提示卡片
+                is_generic_selector = selector in (".el-card", "li[class*='item']", "[class*='content-item']")
+                if is_generic_selector and guessed_kind == TaskKind.UNKNOWN and not any(
+                    hint in raw_text for hint in ("未完成", "未读", "未看", "进行中", "共", "页", "讲")
+                ):
+                    continue
+
                 if not self._is_kind_enabled(guessed_kind):
                     continue
 
@@ -282,6 +309,47 @@ class CourseScheduler:
                     continue
 
                 return task_key, short_title, guessed_kind, item
+
+        # 2. 语义兜底：针对标准版雨课堂 /v2/web/studentLog/ 的动态类名卡片，按最小包含块匹配
+        try:
+            fallback_nodes = driver.execute_script(
+                """
+                const kws = ['课件', 'PPT', '视频', '录播', '习题', '作业', '测验', '预习', '未完成', '未读', '未看', '讲'];
+                const done = ['已完成', '已读', '已看完', '100%', '已提交', '已作答'];
+                const candidates = Array.from(document.querySelectorAll('div, li, section, article, a'));
+                const matched = [];
+                for (const el of candidates) {
+                  const rect = el.getBoundingClientRect();
+                  if (rect.width < 120 || rect.height < 28 || rect.height > 260) continue;
+                  const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                  if (txt.length < 6 || txt.length > 260) continue;
+                  if (done.some((d) => txt.includes(d))) continue;
+                  if (!kws.some((k) => txt.includes(k))) continue;
+                  // 跳过包裹多个子卡片的大父容器：只保留本身尽量紧凑的卡片层
+                  const hasChildMatch = Array.from(el.children).some((c) => {
+                    const ct = (c.innerText || '').replace(/\\s+/g, ' ').trim();
+                    return ct.length >= 6 && kws.some((k) => ct.includes(k)) && c.getBoundingClientRect().height >= 28;
+                  });
+                  if (!hasChildMatch) matched.push(el);
+                }
+                return matched.slice(0, 40);
+                """
+            ) or []
+            for idx, node in enumerate(fallback_nodes):
+                raw_text = " ".join((node.text or "").split())
+                if not raw_text or raw_text in SELECTORS.ignored_nav_texts:
+                    continue
+                guessed_kind = classify_task_text(raw_text)
+                if not self._is_kind_enabled(guessed_kind):
+                    continue
+                short_title = raw_text[:45]
+                task_key = f"semantic#{idx}:{short_title}"
+                if task_key in attempted_keys:
+                    continue
+                return task_key, short_title, guessed_kind, node
+        except WebDriverException:
+            pass
+
         return None
 
     def _is_kind_enabled(self, kind: TaskKind) -> bool:

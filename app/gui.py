@@ -14,7 +14,15 @@ from typing import Optional
 
 import customtkinter as ctk
 
-from app.config import ALLOWED_BROWSERS, ALLOWED_VIDEO_SPEEDS, SERVER_PRESETS, AppConfig, load_config, save_config
+from app.config import (
+    ALLOWED_BROWSERS,
+    ALLOWED_VIDEO_SPEEDS,
+    DEEPSEEK_MODEL_PRESETS,
+    SERVER_PRESETS,
+    AppConfig,
+    load_config,
+    save_config,
+)
 from app.logger import LogMessage, setup_logger
 from core.auth import ensure_logged_in
 from core.browser import BrowserManager
@@ -164,8 +172,14 @@ class YuketangApp(ctk.CTk):
         ).grid(row=0, column=1, padx=(6, 0))
         row += 1
 
-        self.model_var = ctk.StringVar(value="deepseek-chat")
-        row = self._add_labeled_entry(left_panel, row, "DeepSeek 模型", self.model_var, placeholder="deepseek-chat")
+        self.model_var = ctk.StringVar(value="deepseek-v4-pro,deepseek-v4-flash")
+        ctk.CTkLabel(left_panel, text="DeepSeek 模型", anchor="w").grid(row=row, column=0, sticky="w", padx=8, pady=6)
+        ctk.CTkComboBox(
+            left_panel,
+            variable=self.model_var,
+            values=list(DEEPSEEK_MODEL_PRESETS),
+        ).grid(row=row, column=1, sticky="ew", padx=8, pady=6)
+        row += 1
 
         self.auto_submit_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(left_panel, text="全部题型答完直接自动提交", variable=self.auto_submit_var).grid(
@@ -191,41 +205,49 @@ class YuketangApp(ctk.CTk):
         self.status_label = ctk.CTkLabel(header, text="状态：待机中", text_color="#3B8ED0")
         self.status_label.pack(side="right")
 
-        # 操作按钮区
+        # 操作按钮区（紧凑排布，确保在默认窗口宽度下全部按钮完整显示）
         btn_bar = ctk.CTkFrame(right_panel, fg_color="transparent")
         btn_bar.grid(row=1, column=0, sticky="ew", padx=14, pady=(4, 8))
 
-        self.open_browser_btn = ctk.CTkButton(btn_bar, text="打开浏览器扫码", width=130, command=self._on_open_browser)
-        self.open_browser_btn.pack(side="left", padx=(0, 8))
+        self.open_browser_btn = ctk.CTkButton(btn_bar, text="打开浏览器扫码", width=116, command=self._on_open_browser)
+        self.open_browser_btn.pack(side="left", padx=(0, 6))
 
         self.start_btn = ctk.CTkButton(
-            btn_bar, text="开始刷课", width=110, fg_color="#2FA572", hover_color="#228B5B", command=self._on_start
+            btn_bar, text="开始刷课", width=90, fg_color="#2FA572", hover_color="#228B5B", command=self._on_start
         )
-        self.start_btn.pack(side="left", padx=(0, 8))
+        self.start_btn.pack(side="left", padx=(0, 6))
 
         self.stop_btn = ctk.CTkButton(
             btn_bar,
             text="停止任务",
-            width=100,
+            width=86,
             fg_color="#D9534F",
             hover_color="#B52B27",
             state="disabled",
             command=self._on_stop,
         )
-        self.stop_btn.pack(side="left", padx=(0, 8))
+        self.stop_btn.pack(side="left", padx=(0, 6))
 
-        ctk.CTkButton(btn_bar, text="保存配置", width=90, command=self._on_save_config).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(btn_bar, text="页面结构诊断", width=115, command=self._on_manual_diagnostics).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(btn_bar, text="清空日志", width=80, fg_color="gray45", command=self._clear_logs).pack(side="right")
+        ctk.CTkButton(btn_bar, text="保存配置", width=80, command=self._on_save_config).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btn_bar, text="页面诊断", width=84, command=self._on_manual_diagnostics).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btn_bar, text="清空日志", width=76, fg_color="gray45", command=self._clear_logs).pack(side="right")
 
-        # 实时日志文本框
-        self.log_box = ctk.CTkTextbox(right_panel, font=ctk.CTkFont(family="Consolas", size=12), wrap="word")
+        # 实时日志文本框：采用深色控制台底色 + 高对比度字体，避免浅色模式下看不清
+        self.log_box = ctk.CTkTextbox(
+            right_panel,
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
+            fg_color="#181C24",
+            text_color="#E6EDF3",
+            border_width=1,
+            border_color="#30363D",
+            wrap="word",
+        )
         self.log_box.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 14))
         self.log_box.configure(state="disabled")
-        # 配置不同日志等级的颜色标签（使用底层 tk.Text 的 tag_config）
-        self.log_box._textbox.tag_config("INFO", foreground="#D8E6F3")
-        self.log_box._textbox.tag_config("WARNING", foreground="#F0AD4E")
-        self.log_box._textbox.tag_config("ERROR", foreground="#FF6B6B")
+        # 配置不同日志等级的高对比度颜色标签（使用底层 tk.Text 的 tag_config）
+        self.log_box._textbox.tag_config("INFO", foreground="#F0F6FC")
+        self.log_box._textbox.tag_config("WARNING", foreground="#FFD166")
+        self.log_box._textbox.tag_config("ERROR", foreground="#FF7B72")
 
         self.logger.info("欢迎使用雨课堂自动学习助手！建议首次使用先点击「打开浏览器扫码」，登录并进入课程后再点击「开始刷课」。")
 

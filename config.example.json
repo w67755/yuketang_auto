@@ -15,7 +15,7 @@
   "ppt_retry_rounds": 2,
   "ppt_retry_extra_seconds": 3.0,
   "deepseek_api_key": "",
-  "deepseek_model": "deepseek-chat",
+  "deepseek_model": "deepseek-v4-pro,deepseek-v4-flash",
   "deepseek_base_url": "https://api.deepseek.com",
   "auto_submit_quiz": true,
   "save_diagnostics_on_error": true

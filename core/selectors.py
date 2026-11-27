@@ -91,17 +91,41 @@ class SelectorRegistry:
         "[class*='section-header']",
         ".chapter-title",
     )
-    # 单个学习任务条目（兼容 v2/web 学习日志卡片 与 pro/lms 章节叶子节点）
+    # 单个学习任务条目（兼容 v2/web 学习日志卡片、ElementUI 卡片与 pro/lms 章节叶子节点）
     task_item_selectors: Tuple[str, ...] = (
         ".study-unit",
-        ".leaf-detail",
-        ".log-item",
+        ".activity__wrap",
+        ".activity-box",
         ".activity-item",
+        ".log-item",
+        ".log-card",
+        ".content-box",
+        ".card-box",
+        ".leaf-detail",
         ".chapter-list .leaf",
+        "[class*='activity']",
+        "[class*='study-unit']",
+        "[class*='student-log'] .el-card",
+        ".el-timeline-item__content",
+        ".el-card",
         "[class*='leaf-item']",
         "[class*='unit-item']",
         "[class*='content-item']",
         "li[class*='item']",
+    )
+    # 用于排除导航栏/筛选栏等非学习任务节点的关键词
+    ignored_nav_texts: Tuple[str, ...] = (
+        "课程班级",
+        "资源库",
+        "返回旧版",
+        "学习日志",
+        "我教的课",
+        "我听的课",
+        "成绩单",
+        "公告",
+        "讨论区",
+        "班级成员",
+        "全部",
     )
     # 表明任务已完成的文本关键词
     completed_keywords: Tuple[str, ...] = (
@@ -111,6 +135,7 @@ class SelectorRegistry:
         "100%",
         "已提交",
         "已作答",
+        "已签收",
     )
     # 用于基于任务标题/角标判断任务类型的关键词
     video_type_keywords: Tuple[str, ...] = (

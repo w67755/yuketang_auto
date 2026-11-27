@@ -176,8 +176,8 @@ def enter_course_by_name(
 
 
 def _find_course_element(driver: WebDriver, course_name: str) -> Optional[object]:
-    """在课程卡片及可见节点中按包含关系查找课程元素。"""
-    keyword = course_name.strip().lower()
+    """在课程卡片及可见节点中按忽略空格的包含关系查找课程元素（兼容“形势与政策7”匹配“形势与政策 7”）。"""
+    keyword = "".join(course_name.split()).lower()
     if not keyword:
         return None
 
@@ -185,18 +185,27 @@ def _find_course_element(driver: WebDriver, course_name: str) -> Optional[object
         try:
             cards = driver.find_elements(By.CSS_SELECTOR, selector)
             for card in cards:
-                if card.is_displayed() and keyword in (card.text or "").lower():
+                card_norm = "".join((card.text or "").split()).lower()
+                if card.is_displayed() and keyword in card_norm:
                     return card
         except WebDriverException:
             continue
 
-    # 兜底：通过文本节点向上定位最近的可点击容器
+    # 兜底：遍历可见卡片/标题元素，忽略中间空白后匹配
     try:
-        xpath = f"//*[contains(normalize-space(), '{course_name}')]"
-        nodes = driver.find_elements(By.XPATH, xpath)
+        nodes = driver.find_elements(By.CSS_SELECTOR, "h1, h2, h3, h4, p, span, div")
+        best_node = None
+        best_len = 10**9
         for node in nodes:
-            if node.is_displayed():
-                return node
+            if not node.is_displayed():
+                continue
+            raw = (node.text or "").strip()
+            norm = "".join(raw.split()).lower()
+            if keyword in norm and len(norm) < best_len:
+                best_node = node
+                best_len = len(norm)
+        if best_node is not None:
+            return best_node
     except WebDriverException:
         pass
     return None
