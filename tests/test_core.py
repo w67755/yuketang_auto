@@ -12,6 +12,7 @@ from core.scheduler import (
     detect_page_task_kind,
     is_collapsible_bundle_text,
     is_progress_fraction_completed,
+    is_protected_essay_task,
     task_priority_rank,
 )
 from tasks.auto_quiz import detect_question_type, match_option_indices
@@ -90,6 +91,9 @@ class TestCoreLogic(unittest.TestCase):
         self.assertFalse(is_progress_fraction_completed("视频 第七讲数字中国与科技创新 考核截止时间: 2027-01-31/23:59/周日 未开始"))
         self.assertFalse(is_progress_fraction_completed("第五讲 双碳行动 请在2027-01-31/23:59前完成学习 进行中(70/75)"))
         self.assertTrue(is_collapsible_bundle_text("视频学习 等 包含3章，0小节，共计9个学习单元 展开 进行中"))
+        self.assertTrue(is_protected_essay_task("专题心得体会 请在2027-01-31前完成 未开始"))
+        self.assertTrue(is_protected_essay_task("期末小论文 未提交"))
+        self.assertFalse(is_protected_essay_task("第五讲双碳行动中的中国与世界 未开始"))
         self.assertLess(task_priority_rank(TaskKind.VIDEO, "video_first"), task_priority_rank(TaskKind.PPT, "video_first"))
         self.assertLess(task_priority_rank(TaskKind.PPT, "ppt_first"), task_priority_rank(TaskKind.VIDEO, "ppt_first"))
         self.assertEqual(

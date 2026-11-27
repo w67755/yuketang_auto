@@ -115,6 +115,18 @@ class QuizSolver(BaseTask):
     def execute(self, title: str) -> TaskResult:
         driver = self.browser.ensure_started()
         self.browser.inject_anti_blur_now()
+
+        # 双重安全锁：即使开启了 AI 做题，遇到论文/心得/报告等重要主观考核任务也强制跳过
+        page_head_text = ""
+        try:
+            page_head_text = driver.execute_script("return document.body ? document.body.innerText.slice(0, 600) : '';") or ""
+        except WebDriverException:
+            pass
+        if any(kw in (title or "") or kw in page_head_text for kw in SELECTORS.protected_essay_keywords):
+            msg = f"检测到论文/心得类重要主观考核任务（{title}），安全保护已拦截，绝不自动作答或提交。"
+            self.logger.warning("【安全保护】%s", msg)
+            return TaskResult(title, TaskKind.QUIZ, TaskStatus.SKIPPED, msg)
+
         self.logger.info("【做题】开始处理习题：%s", title)
 
         client = DeepSeekClient(

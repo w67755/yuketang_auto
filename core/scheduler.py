@@ -106,6 +106,13 @@ def is_collapsible_bundle_text(text: str) -> bool:
     return bool(re.search(r"包含\s*\d+\s*章.*学习单元", text))
 
 
+def is_protected_essay_task(text: str) -> bool:
+    """判断是否为论文/心得/报告等需要人工撰写的重要考核任务（强制保护，绝不自动作答或误交）。"""
+    if not text:
+        return False
+    return any(kw in text for kw in SELECTORS.protected_essay_keywords)
+
+
 def classify_task_text(text: str) -> TaskKind:
     """根据课程目录中任务条目的标题与角标文本初步判定任务类型。"""
     if not text:
@@ -403,7 +410,7 @@ class CourseScheduler:
 
                 if raw_text in SELECTORS.ignored_nav_texts:
                     continue
-                if is_collapsible_bundle_text(raw_text):
+                if is_collapsible_bundle_text(raw_text) or is_protected_essay_task(raw_text):
                     continue
                 if any(done_kw in raw_text for done_kw in SELECTORS.completed_keywords):
                     continue
@@ -459,7 +466,7 @@ class CourseScheduler:
                 raw_text = " ".join((node.text or "").split())
                 if not raw_text or raw_text in SELECTORS.ignored_nav_texts:
                     continue
-                if is_collapsible_bundle_text(raw_text) or is_progress_fraction_completed(raw_text):
+                if is_collapsible_bundle_text(raw_text) or is_protected_essay_task(raw_text) or is_progress_fraction_completed(raw_text):
                     continue
                 guessed_kind = classify_task_text(raw_text)
                 if not self._is_kind_enabled(guessed_kind):
@@ -572,6 +579,8 @@ class CourseScheduler:
             if not raw_text or element is None:
                 continue
             if any(done_kw in raw_text for done_kw in SELECTORS.completed_keywords):
+                continue
+            if is_protected_essay_task(raw_text):
                 continue
             if is_progress_fraction_completed(raw_text):
                 continue
