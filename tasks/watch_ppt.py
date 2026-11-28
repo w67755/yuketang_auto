@@ -90,17 +90,25 @@ function collectThumbItems(scope) {
     if (pageNo < 1 || pageNo > 2000) continue;
 
     const cls = (el.className || '').toString().toLowerCase();
-    const completed = text.includes('已完成') || cls.includes('finish') || cls.includes('complete');
+    const unread = text.includes('未读') || text.includes('未看') || text.includes('未完成') || cls.includes('unread') || cls.includes('unviewed');
+    const completed = !unread && (text.includes('已完成') || cls.includes('finish') || cls.includes('complete'));
     const active = cls.includes('active') || cls.includes('selected') || cls.includes('current');
 
     // 同一页码优先保留面积更紧凑的内层卡片元素
     const prev = byPage.get(pageNo);
     const area = rect.width * rect.height;
     if (!prev || area < prev.area) {
-      byPage.set(pageNo, { pageNo, element: el, completed, active, area });
+      byPage.set(pageNo, { pageNo, element: el, completed, unread, active, area });
     }
   }
-  return Array.from(byPage.values()).sort((a, b) => a.pageNo - b.pageNo);
+  const arr = Array.from(byPage.values()).sort((a, b) => a.pageNo - b.pageNo);
+  // 标准版雨课堂课件页：未看页标有紫色“未读”角标，已看页无角标；若列表中存在“未读”项，则无“未读”项即为已完成！
+  if (arr.some((it) => it.unread)) {
+    for (const it of arr) {
+      if (!it.unread) it.completed = true;
+    }
+  }
+  return arr;
 }
 
 const container = findLeftScrollContainer();
@@ -206,6 +214,10 @@ class PptWatcher(BaseTask):
         if not interruptible_sleep(1.5, self.stop_event):
             return TaskResult(title, TaskKind.PPT, TaskStatus.STOPPED, "用户手动停止")
 
+        current_url = (driver.current_url or "").lower()
+        if "/studycontent" in current_url or "/studentlog/" in current_url:
+            return TaskResult(title, TaskKind.PPT, TaskStatus.FAILED, "当前仍停留在课程列表页，未成功打开课件详情页")
+
         self.logger.info(
             "【课件】开始观看：%s（每页随机停留 %.1f~%.1f 秒，最多补看 %d 轮）",
             title,
@@ -222,6 +234,12 @@ class PptWatcher(BaseTask):
             if done >= total:
                 self.logger.info("【课件】《%s》进度已满（%d/%d），无需重复观看。", title, done, total)
                 return TaskResult(title, TaskKind.PPT, TaskStatus.SKIPPED, f"学习进度已满 {done}/{total}")
+            # 半程课件（如 70/75）：优先切换到左侧栏「未完成」标签页，只精准补刷剩余的几页！
+            if 0 < done < total and self._watch_via_unfinished_tab(driver, title, extra_dwell=0.0):
+                after_fast = self._read_study_progress(driver)
+                if after_fast and after_fast[0] >= after_fast[1]:
+                    self.logger.info("【课件】《%s》通过「未完成」筛选页快速补齐至 %d/%d！", title, after_fast[0], after_fast[1])
+                    return TaskResult(title, TaskKind.PPT, TaskStatus.COMPLETED, f"学习进度已达 {after_fast[0]}/{after_fast[1]}")
 
         # 2. 若进入时停在“您还有以下页面未看”结果页，先直接触发定向补看
         initial_missed = self._detect_unviewed_pages(driver)
@@ -269,6 +287,95 @@ class PptWatcher(BaseTask):
     # ------------------------------------------------------------------
     # 核心：按页码 1..total 顺序遍历虚拟滚动缩略图（绝不跳页）
     # ------------------------------------------------------------------
+    def _watch_via_unfinished_tab(self, driver: WebDriver, title: str, extra_dwell: float = 0.0) -> bool:
+        """在雨课堂课件页点击左侧「未完成」筛选标签，仅对剩余未读页精准停留（如 70/75 只需刷 5 页）。"""
+        try:
+            clicked_tab = driver.execute_script(
+                r"""
+                const nodes = Array.from(document.querySelectorAll('span, div, li, a, button'));
+                for (const el of nodes) {
+                  const r = el.getBoundingClientRect();
+                  if (r.width <= 0 || r.height <= 0 || r.left > window.innerWidth * 0.35 || r.top > 220) continue;
+                  const txt = (el.innerText || '').replace(/\s+/g, '').trim();
+                  if (txt === '未完成' || /^未完成\(\d+\)$/.test(txt)) {
+                    el.click();
+                    return true;
+                  }
+                }
+                return false;
+                """
+            )
+        except WebDriverException:
+            return False
+
+        if not clicked_tab:
+            return False
+
+        self.logger.info("【课件】已切换至左侧「未完成」标签页，仅针对未读页面精准停留...")
+        interruptible_sleep(0.8, self.stop_event)
+        visited_in_tab: set[int] = set()
+
+        for _ in range(120):
+            if self.stop_event.is_set():
+                return False
+
+            prog = self._read_study_progress(driver)
+            if prog and prog[0] >= prog[1]:
+                break
+
+            try:
+                next_slide = driver.execute_script(
+                    r"""
+                    const visited = new Set(arguments[0]);
+                    const raw = Array.from(
+                      document.querySelectorAll('[class*="slide"], [class*="thumb"], [class*="ppt-item"], [class*="page-item"], [class*="card-item"], li')
+                    );
+                    for (const el of raw) {
+                      const r = el.getBoundingClientRect();
+                      if (r.left > window.innerWidth * 0.35 || r.width < 60 || r.height < 40 || r.height > 240) continue;
+                      if (!el.querySelector('img, canvas')) continue;
+                      if (el.querySelectorAll('img, canvas').length > 3) continue;
+                      const m = ((el.innerText || '').trim()).match(/\b(\d{1,4})\b/);
+                      const pageNo = m ? Number(m[1]) : -1;
+                      if (pageNo > 0 && !visited.has(pageNo)) {
+                        el.click();
+                        return pageNo;
+                      }
+                    }
+                    return null;
+                    """,
+                    list(visited_in_tab),
+                )
+            except WebDriverException:
+                next_slide = None
+
+            if next_slide is None:
+                break
+
+            visited_in_tab.add(int(next_slide))
+            dwell = self._pick_dwell_seconds(extra=extra_dwell)
+            self.logger.info("【课件】《%s》补刷未完成第 %d 页，停留 %.1f 秒...", title, int(next_slide), dwell)
+            if not self._dwell_with_keepalive(driver, dwell):
+                return False
+
+        # 切回「全部」标签页以便后续常规检查
+        try:
+            driver.execute_script(
+                r"""
+                for (const el of document.querySelectorAll('span, div, li, a, button')) {
+                  const r = el.getBoundingClientRect();
+                  if (r.width > 0 && r.left < window.innerWidth * 0.35 && r.top < 220 && (el.innerText || '').trim() === '全部') {
+                    el.click();
+                    break;
+                  }
+                }
+                """
+            )
+        except WebDriverException:
+            pass
+        interruptible_sleep(0.5, self.stop_event)
+        return len(visited_in_tab) > 0
+
     def _walk_virtual_sidebar_by_page_number(
         self,
         driver: WebDriver,
@@ -334,9 +441,10 @@ class PptWatcher(BaseTask):
                 max_rounds,
                 extra_sec,
             )
-            ok = self._walk_virtual_sidebar_by_page_number(driver, title, total_pages, extra_dwell=extra_sec)
-            if not ok:
-                return TaskResult(title, TaskKind.PPT, TaskStatus.STOPPED, "用户手动停止")
+            if not self._watch_via_unfinished_tab(driver, title, extra_dwell=extra_sec):
+                ok = self._walk_virtual_sidebar_by_page_number(driver, title, total_pages, extra_dwell=extra_sec)
+                if not ok:
+                    return TaskResult(title, TaskKind.PPT, TaskStatus.STOPPED, "用户手动停止")
 
             interruptible_sleep(1.5, self.stop_event)
             after = self._read_study_progress(driver)

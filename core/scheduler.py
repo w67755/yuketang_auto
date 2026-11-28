@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from selenium.common.exceptions import StaleElementReferenceException, WebDriverException
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver
 
@@ -203,6 +204,8 @@ class CourseScheduler:
         self.video_watcher = VideoWatcher(config, browser, logger, stop_event)
         self.ppt_watcher = PptWatcher(config, browser, logger, stop_event)
         self.quiz_solver = QuizSolver(config, browser, logger, stop_event)
+        # 记录本次运行中已 100% 完成的 (任务类型, 归一化标题)，防止跨阶段或列表进度延迟刷新导致重复刷
+        self._completed_signatures: set[str] = set()
 
     def run(self) -> RunSummary:
         """执行完整刷课流程并返回汇总报告。"""
@@ -266,37 +269,40 @@ class CourseScheduler:
         study_content_url = self._detect_study_content_url(driver)
 
         if study_content_url and "/studycontent" not in student_log_url.lower():
-            phases: List[Tuple[str, str]] = []
-            # 根据用户设置的优先顺序编排「学习内容（视频/章节）」与「学习日志（课件）」的执行次序
+            # (阶段名, 页面URL, 是否在 studycontent 中跳过课件交给学习日志处理)
+            phases: List[Tuple[str, str, bool]] = []
             need_study_content = self.config.enable_video or self.config.enable_quiz
             need_student_log = self.config.enable_ppt or self.config.enable_video or self.config.enable_quiz
 
             if self.config.task_order == "ppt_first":
                 if need_student_log:
-                    phases.append((f"{course_label} · 学习日志（课件）", student_log_url))
+                    phases.append((f"{course_label} · 学习日志（课件）", student_log_url, False))
                 if need_study_content:
-                    phases.append((f"{course_label} · 学习内容（视频/章节）", study_content_url))
+                    phases.append((f"{course_label} · 学习内容（视频/章节）", study_content_url, True))
             else:
                 if need_study_content:
-                    phases.append((f"{course_label} · 学习内容（视频/章节）", study_content_url))
+                    phases.append((f"{course_label} · 学习内容（视频/章节）", study_content_url, True))
                 if need_student_log:
-                    phases.append((f"{course_label} · 学习日志（课件）", student_log_url))
+                    phases.append((f"{course_label} · 学习日志（课件）", student_log_url, False))
 
             self.logger.info(
                 "检测到该课程同时包含「学习内容（视频/章节）」与「学习日志（课件）」，将按配置顺序依次处理：%s",
-                " -> ".join(name for name, _ in phases),
+                " -> ".join(name for name, _, _ in phases),
             )
-            for phase_name, phase_url in phases:
+            for phase_name, phase_url, skip_ppt_in_studycontent in phases:
                 if self.stop_event.is_set():
                     break
-                if driver.current_url != phase_url:
-                    driver.get(phase_url)
-                    if not interruptible_sleep(2.5, self.stop_event):
-                        break
-                self._scan_and_run_list_page(summary, course_label=phase_name)
+                driver.get(phase_url)
+                if not interruptible_sleep(2.5, self.stop_event):
+                    break
+                self._scan_and_run_list_page(
+                    summary,
+                    course_label=phase_name,
+                    skip_ppt_in_studycontent=skip_ppt_in_studycontent,
+                )
             return
 
-        self._scan_and_run_list_page(summary, course_label=course_label)
+        self._scan_and_run_list_page(summary, course_label=course_label, skip_ppt_in_studycontent=False)
 
     def _detect_study_content_url(self, driver: WebDriver) -> Optional[str]:
         """提取雨课堂课程页中指向「学习内容（/pro/lms/.../studycontent）」的同源 URL。"""
@@ -310,7 +316,12 @@ class CourseScheduler:
                 continue
         return None
 
-    def _scan_and_run_list_page(self, summary: RunSummary, course_label: str) -> None:
+    def _scan_and_run_list_page(
+        self,
+        summary: RunSummary,
+        course_label: str,
+        skip_ppt_in_studycontent: bool = False,
+    ) -> None:
         """在单个列表页（学习内容页或学习日志页）内按优先级扫描并依次完成未完成任务。"""
         driver = self.browser.ensure_started()
         self.logger.info("正在扫描《%s》中的未完成任务点...", course_label)
@@ -323,34 +334,40 @@ class CourseScheduler:
 
         # 用“已尝试过的任务指纹集合”防止同一异常任务陷入死循环
         attempted_keys: set[str] = set()
+        need_refresh = False
         max_rounds = 200
 
         for _ in range(max_rounds):
             if self.stop_event.is_set():
                 break
 
-            # 确保每次扫描都回到当前列表主标签页
+            # 确保每次回到列表主标签页，并强制刷新页面以拉取刚刚刷完任务的最新完成度（防止 0% 旧缓存导致重刷）
             self.browser.close_extra_tabs(course_list_handle)
             if driver.current_url != course_list_url:
                 driver.get(course_list_url)
                 if not interruptible_sleep(2.5, self.stop_event):
                     break
                 self._expand_collapsed_chapters(driver)
+                need_refresh = False
+            elif need_refresh:
+                try:
+                    driver.refresh()
+                except WebDriverException:
+                    driver.get(course_list_url)
+                if not interruptible_sleep(2.5, self.stop_event):
+                    break
+                self._expand_collapsed_chapters(driver)
+                interruptible_sleep(0.8, self.stop_event)
+                need_refresh = False
 
-            next_candidate = self._find_next_pending_task(driver, attempted_keys)
+            next_candidate = self._find_next_pending_task(
+                driver,
+                attempted_keys,
+                skip_ppt_in_studycontent=skip_ppt_in_studycontent,
+            )
             if next_candidate is None:
                 if not attempted_keys:
-                    self.logger.warning(
-                        "在《%s》当前页面未识别到未完成任务点（可能全部已完成，或该页 DOM 选择器需适配）。",
-                        course_label,
-                    )
-                    if self.config.save_diagnostics_on_error:
-                        capture_diagnostics(
-                            driver,
-                            f"zero_tasks_{course_label}",
-                            "课程页面未识别到任何待处理任务点",
-                            self.logger,
-                        )
+                    self.logger.info("《%s》当前无可处理的未完成任务点。", course_label)
                 else:
                     self.logger.info("《%s》所有符合条件的未完成任务点已处理完毕！", course_label)
                 break
@@ -362,21 +379,16 @@ class CourseScheduler:
             before_handles = set(driver.window_handles)
             before_url = driver.current_url
 
-            try:
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
-                time.sleep(0.4)
-                driver.execute_script("arguments[0].click();", element)
-            except WebDriverException as exc:
-                self.logger.error("点击任务《%s》失败：%s", task_title, exc)
+            if not self._click_task_element(driver, element, task_title):
                 if self.config.save_diagnostics_on_error:
-                    capture_diagnostics(driver, f"click_failed_{task_title}", str(exc), self.logger)
-                summary.record(TaskResult(task_title, guessed_kind, TaskStatus.FAILED, str(exc)))
+                    capture_diagnostics(driver, f"click_failed_{task_title}", "点击任务元素异常", self.logger)
+                summary.record(TaskResult(task_title, guessed_kind, TaskStatus.FAILED, "点击任务元素失败"))
                 continue
 
             if not interruptible_sleep(2.5, self.stop_event):
                 break
 
-            # 判断是新标签页打开还是当前页跳转
+            # 判断是新标签页打开还是当前页路由跳转
             new_handles = list(set(driver.window_handles) - before_handles)
             if new_handles:
                 driver.switch_to.window(new_handles[-1])
@@ -386,15 +398,57 @@ class CourseScheduler:
 
             self.browser.inject_anti_blur_now()
             actual_kind = self._inspect_current_page_kind(driver)
+
+            # 关键防空跑校验：若既未打开新标签页、URL 也未变化、页面内也没有出现播放器/课件/试题，
+            # 说明点击未触发跳转，严禁停留在目录页假刷！
+            if not new_handles and driver.current_url == before_url and actual_kind == TaskKind.UNKNOWN:
+                msg = f"点击任务《{task_title}》后页面未发生跳转，已跳过（避免在课程目录页空跑）"
+                self.logger.warning(msg)
+                summary.record(TaskResult(task_title, guessed_kind, TaskStatus.SKIPPED, msg))
+                continue
+
             if actual_kind == TaskKind.UNKNOWN:
                 actual_kind = guessed_kind
 
             result = self._execute_single_task(actual_kind, title=task_title)
             summary.record(result)
+            if result.status == TaskStatus.COMPLETED:
+                self._completed_signatures.add(self._make_completion_signature(actual_kind, task_title))
 
-            # 任务完成后清理临时标签页，回到列表继续下一项
+            # 任务完成后清理临时标签页，并标记下一轮必须刷新列表页进度
             self.browser.close_extra_tabs(course_list_handle)
+            need_refresh = True
             interruptible_sleep(1.0, self.stop_event)
+
+    def _click_task_element(self, driver: WebDriver, element: object, task_title: str) -> bool:
+        """优先使用模拟真实鼠标点击触发 Vue 事件，失败时回退 JS click。"""
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+            time.sleep(0.35)
+        except WebDriverException as exc:
+            self.logger.error("滚动至任务《%s》失败：%s", task_title, exc)
+            return False
+
+        try:
+            ActionChains(driver).move_to_element(element).pause(0.1).click().perform()
+            return True
+        except WebDriverException:
+            try:
+                driver.execute_script("arguments[0].click();", element)
+                return True
+            except WebDriverException as exc:
+                self.logger.error("点击任务《%s》失败：%s", task_title, exc)
+                return False
+
+    def _make_completion_signature(self, kind: TaskKind, raw_title: str) -> str:
+        """提取跨列表通用的任务完成签名（剥离进度、截止时间与空白），杜绝同一任务重复刷。"""
+        cleaned = strip_datetime_noise(raw_title or "")
+        cleaned = re.sub(r"\[.*?\]", "", cleaned)
+        cleaned = re.sub(r"请在.*?完成学习", "", cleaned)
+        cleaned = re.sub(r"\d+\s*/\s*\d+\s*学习进度", "", cleaned)
+        cleaned = re.sub(r"进行中.*|未开始|学习中.*|已完成.*|\d+(?:\.\d+)?%", "", cleaned)
+        cleaned = re.sub(r"\s+", "", cleaned).lower()[:30]
+        return f"{kind.value}:{cleaned}"
 
     def _expand_collapsed_chapters(self, driver: WebDriver) -> None:
         """展开折叠的章节目录与学习日志中的「展开」合集卡片，确保所有子任务节点可见。"""
@@ -425,14 +479,17 @@ class CourseScheduler:
         self,
         driver: WebDriver,
         attempted_keys: set[str],
+        skip_ppt_in_studycontent: bool = False,
     ) -> Optional[Tuple[str, str, TaskKind, object]]:
         """在当前列表 DOM 中收集未完成任务，并按 `task_order` 优先级返回最应先执行的一项。"""
-        # 0. 若当前在 /pro/lms/.../studycontent（学习内容章节总览页），走精准右侧内容总览扫描器
-        #    严格限定在 section.section-fr 内，绝不会误点左侧目录栏（#chapter-section）或顶部导航栏
+        # 0. 若当前在 /pro/lms/.../studycontent（学习内容章节总览页），只走专用右侧内容总览扫描器，
+        #    不再向下穿透到通用 semantic 扫描器（防止同一视频生成两套 key 导致被重入）
         if "/studycontent" in (driver.current_url or "").lower():
-            study_item = self._find_next_studycontent_task(driver, attempted_keys)
-            if study_item is not None:
-                return study_item
+            return self._find_next_studycontent_task(
+                driver,
+                attempted_keys,
+                skip_ppt=skip_ppt_in_studycontent,
+            )
 
         candidates: List[Tuple[int, int, int, str, str, TaskKind, object]] = []
         seq = 0
@@ -466,6 +523,8 @@ class CourseScheduler:
                     continue
 
                 short_title = raw_text[:45]
+                if self._make_completion_signature(guessed_kind, short_title) in self._completed_signatures:
+                    continue
                 stable_title = re.sub(r"\d+\s*/\s*\d+\s*学习进度", "", short_title).strip()
                 task_key = f"{selector}:{stable_title}"
                 if task_key in attempted_keys:
@@ -516,6 +575,8 @@ class CourseScheduler:
                 if not self._is_kind_enabled(guessed_kind):
                     continue
                 short_title = raw_text[:45]
+                if self._make_completion_signature(guessed_kind, short_title) in self._completed_signatures:
+                    continue
                 stable_title = re.sub(r"\d+\s*/\s*\d+\s*学习进度", "", short_title).strip()
                 task_key = f"semantic:{stable_title}"
                 if task_key in attempted_keys:
@@ -537,6 +598,7 @@ class CourseScheduler:
         self,
         driver: WebDriver,
         attempted_keys: set[str],
+        skip_ppt: bool = False,
     ) -> Optional[Tuple[str, str, TaskKind, object]]:
         """精准扫描「学习内容（/pro/lms/.../studycontent）」右侧内容总览中的未完成任务行。
 
@@ -645,12 +707,17 @@ class CourseScheduler:
 
             # 结合图标特征 + 状态文本精准判定该行是视频、课件还是习题
             guessed_kind = self._classify_studycontent_row(raw_text, status_text, icon_hint)
+            # 当课程存在专门的「学习日志（studentLog）」阶段时，将课件统一留给学习日志阶段稳定打开
+            if skip_ppt and guessed_kind == TaskKind.PPT:
+                continue
             if not self._is_kind_enabled(guessed_kind):
                 continue
 
             # 去掉末尾状态词生成稳定任务指纹，避免进度从“未开始”变“进行中”后重复进入
             clean_title = re.sub(r"请在\d{4}-\d{2}-\d{2}.*?完成学习", "", raw_text)
             clean_title = clean_title.replace(status_text, "").strip()[:45]
+            if self._make_completion_signature(guessed_kind, clean_title) in self._completed_signatures:
+                continue
             task_key = f"studycontent:{guessed_kind.value}:{clean_title}"
             if task_key in attempted_keys:
                 continue
