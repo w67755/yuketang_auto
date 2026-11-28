@@ -373,7 +373,7 @@ class PptWatcher(BaseTask):
             )
         except WebDriverException:
             pass
-        interruptible_sleep(0.5, self.stop_event)
+        self._flush_last_slide_report(driver)
         return len(visited_in_tab) > 0
 
     def _walk_virtual_sidebar_by_page_number(
@@ -419,7 +419,17 @@ class PptWatcher(BaseTask):
 
         if skipped_done > 0:
             self.logger.info("【课件】本轮已自动跳过 %d 个已完成的页面。", skipped_done)
+        # 关键收尾：最后一页停留完后主动切一次相邻页并等待上报落库，防止关标签页太快丢失最后一页进度（如 74/75）
+        self._flush_last_slide_report(driver)
         return True
+
+    def _flush_last_slide_report(self, driver: WebDriver) -> None:
+        """切换一次相邻页并留出网络缓冲，强制触发雨课堂最后一页的停留时长上报请求。"""
+        try:
+            ActionChains(driver).send_keys(Keys.ARROW_UP).perform()
+        except WebDriverException:
+            pass
+        interruptible_sleep(2.5, self.stop_event)
 
     def _run_virtual_remediation_loop(self, driver: WebDriver, title: str, total_pages: int) -> TaskResult:
         """当顶栏显示 done < total 时，按轮次加长停留时间只补看仍未带「已完成」标记的页面。"""

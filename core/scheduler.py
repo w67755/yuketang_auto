@@ -332,8 +332,8 @@ class CourseScheduler:
         course_list_handle = driver.current_window_handle
         course_list_url = driver.current_url
 
-        # 用“已尝试过的任务指纹集合”防止同一异常任务陷入死循环
-        attempted_keys: set[str] = set()
+        # 用“已尝试过的任务指纹集合”防止同一异常任务陷入死循环（允许课件在进度上涨但差 1~2 页时自动补尾 1 次）
+        attempt_counts: Dict[str, int] = {}
         need_refresh = False
         max_rounds = 200
 
@@ -360,20 +360,25 @@ class CourseScheduler:
                 interruptible_sleep(0.8, self.stop_event)
                 need_refresh = False
 
+            # 课件如因网络抖动少记最后一页（刷新后显示 74/75），允许自动二进宫补齐 1 次；视频则严格只进 1 次
+            attempted_keys = {
+                k for k, cnt in attempt_counts.items()
+                if cnt >= (2 if "课件" in course_label else 1)
+            }
             next_candidate = self._find_next_pending_task(
                 driver,
                 attempted_keys,
                 skip_ppt_in_studycontent=skip_ppt_in_studycontent,
             )
             if next_candidate is None:
-                if not attempted_keys:
+                if not attempt_counts:
                     self.logger.info("《%s》当前无可处理的未完成任务点。", course_label)
                 else:
                     self.logger.info("《%s》所有符合条件的未完成任务点已处理完毕！", course_label)
                 break
 
             task_key, task_title, guessed_kind, element = next_candidate
-            attempted_keys.add(task_key)
+            attempt_counts[task_key] = attempt_counts.get(task_key, 0) + 1
             self.logger.info("准备进入任务：%s（预判类型：%s）", task_title, guessed_kind.value)
 
             before_handles = set(driver.window_handles)
@@ -412,7 +417,8 @@ class CourseScheduler:
 
             result = self._execute_single_task(actual_kind, title=task_title)
             summary.record(result)
-            if result.status == TaskStatus.COMPLETED:
+            # 视频和习题完成后记入跨阶段已完成签名防重刷；课件以刷新后的真实 X/Y 分数为准，确保差 1 页时能自动补齐
+            if result.status == TaskStatus.COMPLETED and actual_kind != TaskKind.PPT:
                 self._completed_signatures.add(self._make_completion_signature(actual_kind, task_title))
 
             # 任务完成后清理临时标签页，并标记下一轮必须刷新列表页进度
